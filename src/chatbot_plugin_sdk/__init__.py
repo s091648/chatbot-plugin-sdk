@@ -1,62 +1,49 @@
-"""chatbot_plugin_sdk — Python SDK for the vector storage toolbox.
+"""chatbot_plugin_sdk — RAG ingest & retrieval SDK.
 
-Provides two main entry points:
+Entry points:
 
-- :class:`RagArticleProcessor` — ingestion pipeline (normalise → chunk → embed → save)
-- :class:`RagQueryProcessor` — read-only RAG queries (retrieval + generation)
+- :class:`IngestProcessor` — normalize → chunk → embed → store
+- :class:`RetrieveProcessor` — embed query → vector search → :class:`SearchResponse`
 
-Usage example::
+Providers (inject into ``configure()``):
 
-    # Pipeline: write article to DB
-    from chatbot_plugin_sdk import RagArticleProcessor
+- :class:`EndpointProvider` — HTTP embedding (external API or sidecar)
+- :class:`LocalProvider` — in-process callable (fastembed, etc.)
 
-    ingest = RagArticleProcessor()
-    ingest.configure(
-        dbname="chatbot_plugin",
-        user="postgres",
-        password="postgres",
-        embedding_model_api="http://localhost:8080",
-    )
-    await ingest.ingest(
-        full_text="Retrieval augmented generation is ...",
-        metadata={"url": "https://example.com/article", "title": "RAG 101"},
-    )
+Protocols (for custom provider implementations):
 
-    # Backend service: query with RAG
-    from chatbot_plugin_sdk import RagQueryProcessor
-
-    query = RagQueryProcessor()
-    query.configure(
-        dbname="chatbot_plugin",
-        user="postgres",
-        password="postgres",
-        embedding_model_api="http://localhost:8080",
-    )
-    resp = await query.query("What is RAG?")
-    print(resp.reply)
+- :class:`DenseEmbeddingProvider`
+- :class:`SparseEmbeddingProvider`
 """
 
-from chatbot_plugin_sdk.config import DatabaseConfig, EmbeddingModelConfig
-from chatbot_plugin_sdk.ingest import RagArticleProcessor
-from chatbot_plugin_sdk.query import RagQueryProcessor
+from chatbot_plugin_sdk.processors.ingest import IngestProcessor
+from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
+from chatbot_plugin_sdk.providers.endpoint import EndpointProvider
+from chatbot_plugin_sdk.providers.local import LocalProvider
+from chatbot_plugin_sdk.config import DatabaseConfig
+from chatbot_plugin_sdk.contracts.responses import SearchResponse, ChunkResult
+from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
 from chatbot_plugin_sdk.exceptions import (
-    ChunkingError,
+    ToolboxError,
+    NotConfiguredError,
     DatabaseError,
     EmbeddingError,
-    LLMError,
-    NotConfiguredError,
-    ToolboxError,
+    ChunkingError,
 )
 
 __all__ = [
-    "RagArticleProcessor",
-    "RagQueryProcessor",
+    "IngestProcessor",
+    "RetrieveProcessor",
+    "EndpointProvider",
+    "LocalProvider",
     "DatabaseConfig",
-    "EmbeddingModelConfig",
+    "SearchResponse",
+    "ChunkResult",
+    "DenseEmbeddingProvider",
+    "SparseEmbeddingProvider",
     "ToolboxError",
     "NotConfiguredError",
     "DatabaseError",
     "EmbeddingError",
     "ChunkingError",
-    "LLMError",
 ]

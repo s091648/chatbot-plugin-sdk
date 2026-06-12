@@ -1,32 +1,26 @@
-"""Tests for RagArticleProcessor."""
+"""Tests for IngestProcessor."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chatbot_plugin_sdk import RagArticleProcessor
+from chatbot_plugin_sdk import IngestProcessor, EndpointProvider, DatabaseConfig
 from chatbot_plugin_sdk.exceptions import NotConfiguredError, DatabaseError
 from chatbot_plugin_sdk.chunking import _chunk_text
 
 
 class TestNormalization:
     def test_normalise_collapses_whitespace(self):
-        sdk = RagArticleProcessor()
-        text = "  Hello   world\n\t  foo  "
-        result = sdk._normalize_full_text(text)
+        result = IngestProcessor._normalize("  Hello   world\n\t  foo  ")
         assert result == "Hello world foo"
 
     def test_normalise_nfc_unicode(self):
-        sdk = RagArticleProcessor()
         # e + combining acute = é
-        text = "cafe\u0301"
-        result = sdk._normalize_full_text(text)
-        assert result == "caf\u00e9"
+        result = IngestProcessor._normalize("café")
+        assert result == "café"
 
     def test_normalise_strips_bom(self):
-        sdk = RagArticleProcessor()
-        text = "\ufeffHello"
-        result = sdk._normalize_full_text(text)
+        result = IngestProcessor._normalize("﻿Hello")
         assert result == "Hello"
 
 
@@ -42,34 +36,54 @@ class TestChunking:
         assert chunks == []
 
 
-class TestIngestErrors:
-    @pytest.mark.asyncio
-    async def test_ingest_without_db_config_raises(self):
-        sdk = RagArticleProcessor()
+class TestIngestConfigure:
+    def test_configure_requires_at_least_one_provider(self):
+        processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
-            await sdk.ingest("hello", metadata={"url": "https://example.com"})
+            processor.configure(db=DatabaseConfig(dbname="t", user="u", password="p"))
 
-    @pytest.mark.asyncio
-    async def test_ingest_without_embedding_config_raises(self):
-        sdk = RagArticleProcessor()
-        sdk.configure(dbname="test", user="test", password="test")
-        with pytest.raises(NotConfiguredError):
-            await sdk.ingest("hello", metadata={"url": "https://example.com"})
-
-    @pytest.mark.asyncio
-    async def test_ingest_empty_text_raises(self):
-        sdk = RagArticleProcessor()
-        sdk.configure(
-            dbname="test", user="test", password="test",
-            embedding_model_api="http://localhost:8080",
+    def test_configure_with_dense_only(self):
+        processor = IngestProcessor()
+        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
+        processor.configure(
+            db=DatabaseConfig(dbname="t", user="u", password="p"),
+            dense=dense,
         )
-        with pytest.raises(DatabaseError):
-            await sdk.ingest("   ", metadata={"url": "https://example.com"})
+        assert processor._dense is dense
+        assert processor._sparse is None
+
+    def test_configure_with_sparse_only(self):
+        processor = IngestProcessor()
+        sparse = EndpointProvider(url="http://localhost:8080", response_key="sparse")
+        processor.configure(
+            db=DatabaseConfig(dbname="t", user="u", password="p"),
+            sparse=sparse,
+        )
+        assert processor._dense is None
+        assert processor._sparse is sparse
+
+    def test_configure_resets_ready_flag(self):
+        processor = IngestProcessor()
+        processor._ready = True
+        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
+        processor.configure(
+            db=DatabaseConfig(dbname="t", user="u", password="p"),
+            dense=dense,
+        )
+        assert processor._ready is False
 
 
 class TestIngestPipeline:
-    def _mock_session(self):
-        """Build a MagicMock session that works with SQLAlchemy async patterns."""
+    def _make_processor_with_mock_db(self):
+        """Build IngestProcessor with _ready=True and mocked session factory."""
+        processor = IngestProcessor()
+        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
+        processor.configure(
+            db=DatabaseConfig(dbname="t", user="u", password="p"),
+            dense=dense,
+        )
+        processor._ready = True  # bypass ensure_ready()
+
         mock_result = MagicMock()
         mock_result.scalar_one_or_none.return_value = None
 
@@ -78,75 +92,63 @@ class TestIngestPipeline:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session.execute = AsyncMock(return_value=mock_result)
         mock_session.add = MagicMock()
-        # begin() returns self for use as async context manager
         mock_session.begin = MagicMock(return_value=mock_session)
         mock_session.close = AsyncMock()
-        return mock_session
+
+        from chatbot_plugin_sdk.config import _RuntimeDatabase
+        processor._runtime = _RuntimeDatabase(
+            engine=AsyncMock(),
+            session_factory=MagicMock(return_value=mock_session),
+            schema="vectors",
+        )
+        return processor, mock_session
 
     @pytest.mark.asyncio
-    async def test_ingest_full_pipeline(self):
-        sdk = RagArticleProcessor()
-        sdk.configure(
-            dbname="test", user="test", password="test",
-            embedding_model_api="http://localhost:8080",
-        )
+    async def test_ingest_without_configure_raises(self):
+        processor = IngestProcessor()
+        with pytest.raises(NotConfiguredError):
+            await processor.ingest("hello", metadata={"url": "https://example.com"})
 
-        # Mock the engine so no real DB connection is attempted
-        sdk._db_config.engine = AsyncMock()
-        sdk._tables_created = True
+    @pytest.mark.asyncio
+    async def test_ingest_empty_text_raises(self):
+        processor, _ = self._make_processor_with_mock_db()
+        with pytest.raises(DatabaseError):
+            await processor.ingest("   ", metadata={"url": "https://example.com"})
 
-        mock_session = self._mock_session()
-        sdk._db_config.session_factory = MagicMock(return_value=mock_session)
+    @pytest.mark.asyncio
+    async def test_ingest_missing_url_raises(self):
+        processor, _ = self._make_processor_with_mock_db()
+        with pytest.raises(DatabaseError, match="url"):
+            await processor.ingest("some text content", metadata={})
+
+    @pytest.mark.asyncio
+    async def test_ingest_dense_pipeline(self):
+        processor, mock_session = self._make_processor_with_mock_db()
 
         with patch.object(
-            sdk, "_embed_texts",
-            new_callable=AsyncMock,
+            processor._dense, "embed", new_callable=AsyncMock
         ) as mock_embed:
-            mock_embed.return_value = (
-                [[0.1] * 1024 for _ in range(3)],
-                [{i: 0.1} for i in range(3)],
-            )
-            await sdk.ingest(
+            # side_effect returns exactly as many vectors as chunks received
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
                 "Hello world. " * 100,
                 metadata={"url": "https://example.com/article", "title": "Test"},
             )
             mock_embed.assert_called_once()
-            # Verify save was called
             assert mock_session.execute.called
+            assert mock_session.add.called
 
     @pytest.mark.asyncio
-    async def test_ingest_with_custom_normalization(self):
-        sdk = RagArticleProcessor()
-        sdk.configure(
-            dbname="test", user="test", password="test",
-            embedding_model_api="http://localhost:8080",
-        )
-
-        # Mock the engine so no real DB connection is attempted
-        sdk._db_config.engine = AsyncMock()
-        sdk._tables_created = True
-
-        mock_session = self._mock_session()
-        sdk._db_config.session_factory = MagicMock(return_value=mock_session)
-
-        custom_called = []
-
-        def custom_norm(text):
-            custom_called.append(text)
-            return text.upper()
+    async def test_ingest_dense_vector_count_mismatch_raises(self):
+        processor, _ = self._make_processor_with_mock_db()
 
         with patch.object(
-            sdk, "_embed_texts",
-            new_callable=AsyncMock,
+            processor._dense, "embed", new_callable=AsyncMock
         ) as mock_embed:
-            mock_embed.return_value = (
-                [[0.1] * 1024],
-                [{1: 0.1}],
-            )
-            await sdk.ingest(
-                "hello world",
-                normalization=custom_norm,
-                metadata={"url": "https://example.com/article"},
-            )
-            assert len(custom_called) == 1
-            assert custom_called[0] == "hello world"
+            # Return only 1 vector for many chunks
+            mock_embed.return_value = [[0.1] * 768]
+            with pytest.raises(DatabaseError, match="Dense embedding returned"):
+                await processor.ingest(
+                    "Hello world. " * 100,
+                    metadata={"url": "https://example.com/article"},
+                )
