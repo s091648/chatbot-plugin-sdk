@@ -1,23 +1,33 @@
 """chatbot_plugin_sdk — RAG ingest & retrieval SDK.
 
-Entry points:
+Quick start::
 
-- :class:`IngestProcessor` — normalize → chunk → embed → store
-- :class:`RetrieveProcessor` — embed query → vector search → :class:`SearchResponse`
+    from chatbot_plugin_sdk import (
+        IngestProcessor, RetrieveProcessor,
+        AsyncPgBackend, SyncPgBackend,  # choose one
+        EndpointProvider, LocalProvider,
+        DatabaseConfig,
+    )
 
-Providers (inject into ``configure()``):
+    # ThreadPoolExecutor scenario — use SyncPgBackend:
+    backend = SyncPgBackend(DatabaseConfig(dbname="mydb", user="u", password="p"))
 
-- :class:`EndpointProvider` — HTTP embedding (external API or sidecar)
-- :class:`LocalProvider` — in-process callable (fastembed, etc.)
+    # FastAPI / native asyncio — use AsyncPgBackend:
+    backend = AsyncPgBackend(DatabaseConfig(dbname="mydb", user="u", password="p"))
 
-Protocols (for custom provider implementations):
-
-- :class:`DenseEmbeddingProvider`
-- :class:`SparseEmbeddingProvider`
+    processor = IngestProcessor()
+    processor.configure(
+        backend=backend,
+        dense=EndpointProvider(url="http://embed:8080", dimension=768),
+    )
+    await processor.ingest(full_text="...", metadata={"url": "https://...", "title": "..."})
 """
 
 from chatbot_plugin_sdk.processors.ingest import IngestProcessor
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
+from chatbot_plugin_sdk.backends.async_pg import AsyncPgBackend
+from chatbot_plugin_sdk.backends.sync_pg import SyncPgBackend
+from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
 from chatbot_plugin_sdk.providers.endpoint import EndpointProvider
 from chatbot_plugin_sdk.providers.local import LocalProvider
 from chatbot_plugin_sdk.config import DatabaseConfig
@@ -32,15 +42,26 @@ from chatbot_plugin_sdk.exceptions import (
 )
 
 __all__ = [
+    # Processors
     "IngestProcessor",
     "RetrieveProcessor",
+    # Backends
+    "AsyncPgBackend",
+    "SyncPgBackend",
+    "DatabaseBackend",
+    "SearchRow",
+    # Providers
     "EndpointProvider",
     "LocalProvider",
+    # Config
     "DatabaseConfig",
+    # Responses
     "SearchResponse",
     "ChunkResult",
+    # Protocols
     "DenseEmbeddingProvider",
     "SparseEmbeddingProvider",
+    # Exceptions
     "ToolboxError",
     "NotConfiguredError",
     "DatabaseError",

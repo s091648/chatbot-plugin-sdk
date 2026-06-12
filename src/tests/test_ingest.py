@@ -4,151 +4,175 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chatbot_plugin_sdk import IngestProcessor, EndpointProvider, DatabaseConfig
+from chatbot_plugin_sdk import (
+    IngestProcessor,
+    EndpointProvider,
+    DatabaseBackend,
+)
 from chatbot_plugin_sdk.exceptions import NotConfiguredError, DatabaseError
 from chatbot_plugin_sdk.chunking import _chunk_text
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _mock_backend(schema: str = "vectors") -> AsyncMock:
+    """Return a fully-mocked DatabaseBackend."""
+    backend = AsyncMock(spec=DatabaseBackend)
+    backend.schema = schema
+    return backend
+
+
+def _configured_processor(backend=None) -> tuple[IngestProcessor, AsyncMock]:
+    backend = backend or _mock_backend()
+    dense = EndpointProvider(url="http://localhost:8080", dimension=768)
+    processor = IngestProcessor()
+    processor.configure(backend=backend, dense=dense)
+    processor._ready = True  # bypass ensure_ready() / backend.setup()
+    return processor, backend
+
+
+# ── Normalisation ──────────────────────────────────────────────────────────────
+
 class TestNormalization:
     def test_normalise_collapses_whitespace(self):
-        result = IngestProcessor._normalize("  Hello   world\n\t  foo  ")
-        assert result == "Hello world foo"
+        assert IngestProcessor._normalize("  Hello   world\n\t  foo  ") == "Hello world foo"
 
     def test_normalise_nfc_unicode(self):
-        # e + combining acute = é
-        result = IngestProcessor._normalize("café")
-        assert result == "café"
+        assert IngestProcessor._normalize("café") == "café"
 
     def test_normalise_strips_bom(self):
-        result = IngestProcessor._normalize("﻿Hello")
-        assert result == "Hello"
+        assert IngestProcessor._normalize("﻿Hello") == "Hello"
 
+
+# ── Chunking ───────────────────────────────────────────────────────────────────
 
 class TestChunking:
-    def test_chunk_text_basic(self):
-        text = "Hello world this is a test of chunking. " * 20
-        chunks = _chunk_text(text, chunk_size=50, overlap=10)
+    def test_basic_chunking(self):
+        chunks = _chunk_text("Hello world. " * 20, chunk_size=50, overlap=10)
         assert len(chunks) > 0
         assert all(len(c) <= 50 for c in chunks)
 
-    def test_chunk_text_empty(self):
-        chunks = _chunk_text("   ")
-        assert chunks == []
+    def test_empty_text_returns_empty(self):
+        assert _chunk_text("   ") == []
 
+
+# ── configure() ────────────────────────────────────────────────────────────────
 
 class TestIngestConfigure:
-    def test_configure_requires_at_least_one_provider(self):
+    def test_requires_at_least_one_provider(self):
         processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
-            processor.configure(db=DatabaseConfig(dbname="t", user="u", password="p"))
+            processor.configure(backend=_mock_backend())
 
-    def test_configure_with_dense_only(self):
+    def test_with_dense_only(self):
         processor = IngestProcessor()
-        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
-        processor.configure(
-            db=DatabaseConfig(dbname="t", user="u", password="p"),
-            dense=dense,
-        )
+        dense = EndpointProvider(url="http://x", dimension=768)
+        processor.configure(backend=_mock_backend(), dense=dense)
         assert processor._dense is dense
         assert processor._sparse is None
 
-    def test_configure_with_sparse_only(self):
+    def test_with_sparse_only(self):
         processor = IngestProcessor()
-        sparse = EndpointProvider(url="http://localhost:8080", response_key="sparse")
-        processor.configure(
-            db=DatabaseConfig(dbname="t", user="u", password="p"),
-            sparse=sparse,
-        )
+        sparse = EndpointProvider(url="http://x", response_key="sparse")
+        processor.configure(backend=_mock_backend(), sparse=sparse)
         assert processor._dense is None
         assert processor._sparse is sparse
 
-    def test_configure_resets_ready_flag(self):
+    def test_resets_ready_flag(self):
         processor = IngestProcessor()
         processor._ready = True
-        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
         processor.configure(
-            db=DatabaseConfig(dbname="t", user="u", password="p"),
-            dense=dense,
+            backend=_mock_backend(),
+            dense=EndpointProvider(url="http://x", dimension=768),
         )
         assert processor._ready is False
 
 
-class TestIngestPipeline:
-    def _make_processor_with_mock_db(self):
-        """Build IngestProcessor with _ready=True and mocked session factory."""
+# ── ensure_ready() ─────────────────────────────────────────────────────────────
+
+class TestEnsureReady:
+    @pytest.mark.asyncio
+    async def test_calls_backend_setup_on_first_use(self):
+        backend = _mock_backend()
         processor = IngestProcessor()
-        dense = EndpointProvider(url="http://localhost:8080", dimension=768)
-        processor.configure(
-            db=DatabaseConfig(dbname="t", user="u", password="p"),
-            dense=dense,
-        )
-        processor._ready = True  # bypass ensure_ready()
-
-        mock_result = MagicMock()
-        mock_result.scalar_one_or_none.return_value = None
-
-        mock_session = MagicMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session.execute = AsyncMock(return_value=mock_result)
-        mock_session.add = MagicMock()
-        mock_session.begin = MagicMock(return_value=mock_session)
-        mock_session.close = AsyncMock()
-
-        from chatbot_plugin_sdk.config import _RuntimeDatabase
-        processor._runtime = _RuntimeDatabase(
-            engine=AsyncMock(),
-            session_factory=MagicMock(return_value=mock_session),
-            schema="vectors",
-        )
-        return processor, mock_session
+        processor.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
+        await processor.ensure_ready()
+        backend.setup.assert_called_once_with(768)
+        assert processor._ready is True
 
     @pytest.mark.asyncio
-    async def test_ingest_without_configure_raises(self):
+    async def test_skips_setup_when_already_ready(self):
+        backend = _mock_backend()
+        processor = IngestProcessor()
+        processor.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
+        processor._ready = True
+        await processor.ensure_ready()
+        backend.setup.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_configured(self):
+        processor = IngestProcessor()
+        with pytest.raises(NotConfiguredError):
+            await processor.ensure_ready()
+
+
+# ── ingest() ───────────────────────────────────────────────────────────────────
+
+class TestIngestPipeline:
+    @pytest.mark.asyncio
+    async def test_raises_without_configure(self):
         processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
             await processor.ingest("hello", metadata={"url": "https://example.com"})
 
     @pytest.mark.asyncio
-    async def test_ingest_empty_text_raises(self):
-        processor, _ = self._make_processor_with_mock_db()
+    async def test_raises_on_empty_text(self):
+        processor, _ = _configured_processor()
         with pytest.raises(DatabaseError):
             await processor.ingest("   ", metadata={"url": "https://example.com"})
 
     @pytest.mark.asyncio
-    async def test_ingest_missing_url_raises(self):
-        processor, _ = self._make_processor_with_mock_db()
+    async def test_raises_when_url_missing(self):
+        processor, _ = _configured_processor()
         with pytest.raises(DatabaseError, match="url"):
             await processor.ingest("some text content", metadata={})
 
     @pytest.mark.asyncio
-    async def test_ingest_dense_pipeline(self):
-        processor, mock_session = self._make_processor_with_mock_db()
-
-        with patch.object(
-            processor._dense, "embed", new_callable=AsyncMock
-        ) as mock_embed:
-            # side_effect returns exactly as many vectors as chunks received
+    async def test_calls_backend_upsert(self):
+        processor, backend = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
                 metadata={"url": "https://example.com/article", "title": "Test"},
             )
-            mock_embed.assert_called_once()
-            assert mock_session.execute.called
-            assert mock_session.add.called
+        mock_embed.assert_called_once()
+        backend.upsert.assert_called_once()
+        _, call_kwargs = backend.upsert.call_args
+        # positional: article_id, metadata, chunks, dense_vectors, sparse_vectors
+        call_args = backend.upsert.call_args.args
+        assert call_args[1]["url"] == "https://example.com/article"
+        assert call_args[4] is None  # no sparse provider
 
     @pytest.mark.asyncio
-    async def test_ingest_dense_vector_count_mismatch_raises(self):
-        processor, _ = self._make_processor_with_mock_db()
-
-        with patch.object(
-            processor._dense, "embed", new_callable=AsyncMock
-        ) as mock_embed:
-            # Return only 1 vector for many chunks
-            mock_embed.return_value = [[0.1] * 768]
+    async def test_raises_on_dense_vector_count_mismatch(self):
+        processor, _ = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]  # only 1 vector for many chunks
             with pytest.raises(DatabaseError, match="Dense embedding returned"):
                 await processor.ingest(
                     "Hello world. " * 100,
                     metadata={"url": "https://example.com/article"},
                 )
+
+    @pytest.mark.asyncio
+    async def test_article_id_is_deterministic_from_url(self):
+        import uuid
+        processor, backend = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest("text " * 200, metadata={"url": "https://example.com/x"})
+
+        expected_id = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/x")
+        actual_id = backend.upsert.call_args.args[0]
+        assert actual_id == expected_id
