@@ -1,9 +1,11 @@
 """Tests for EndpointProvider and LocalProvider."""
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
-from chatbot_plugin_sdk import EndpointProvider, LocalProvider
+from chatbot_plugin_sdk import EndpointProvider, LocalProvider, SlidingWindowStrategy
 from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
 
@@ -28,6 +30,62 @@ class TestEndpointProvider:
     def test_sparse_satisfies_protocol(self):
         p = EndpointProvider(url="http://localhost:8080", response_key="sparse")
         assert isinstance(p, SparseEmbeddingProvider)
+
+
+class TestEndpointProviderRateLimit:
+    """EndpointProvider integrates with an injected rate limit strategy."""
+
+    def _make_mock_client(self, response_json: dict) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = response_json
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_acquire_called_before_http_request(self):
+        strategy = MagicMock(spec=SlidingWindowStrategy)
+        strategy.acquire = AsyncMock()
+        strategy.record_usage = MagicMock()
+
+        provider = EndpointProvider(url="http://x", dimension=768, rate_limit=strategy)
+        mock_client = self._make_mock_client({"dense": [[0.1] * 768]})
+
+        with patch.object(provider, "_build_client", return_value=mock_client):
+            await provider.embed(["hello world"])
+
+        strategy.acquire.assert_awaited_once()
+        strategy.record_usage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_acquire_receives_estimated_tokens(self):
+        strategy = MagicMock(spec=SlidingWindowStrategy)
+        strategy.acquire = AsyncMock()
+        strategy.record_usage = MagicMock()
+
+        provider = EndpointProvider(url="http://x", dimension=768, rate_limit=strategy)
+        mock_client = self._make_mock_client({"dense": [[0.1] * 768]})
+
+        # "hello world" = 11 chars → max(1, 11 // 4) = 2 tokens
+        with patch.object(provider, "_build_client", return_value=mock_client):
+            await provider.embed(["hello world"])
+
+        args, _ = strategy.acquire.call_args
+        assert args[0] >= 1
+
+    @pytest.mark.asyncio
+    async def test_no_rate_limit_calls_when_rate_limit_is_none(self):
+        provider = EndpointProvider(url="http://x", dimension=768)  # no rate_limit
+        mock_client = self._make_mock_client({"dense": [[0.1] * 768]})
+
+        with patch.object(provider, "_build_client", return_value=mock_client):
+            result = await provider.embed(["test"])
+
+        assert result == [[0.1] * 768]
 
 
 class TestLocalProvider:

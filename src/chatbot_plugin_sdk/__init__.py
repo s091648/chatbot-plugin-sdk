@@ -40,6 +40,11 @@ from chatbot_plugin_sdk.exceptions import (
     EmbeddingError,
     ChunkingError,
 )
+from chatbot_plugin_sdk.rate_limit import (
+    RateLimitStrategy,
+    SlidingWindowStrategy,
+    RateLimitExhausted,
+)
 
 __all__ = [
     # Processors
@@ -67,4 +72,8 @@ __all__ = [
     "DatabaseError",
     "EmbeddingError",
     "ChunkingError",
+    # Rate limiting
+    "RateLimitStrategy",
+    "SlidingWindowStrategy",
+    "RateLimitExhausted",
 ]

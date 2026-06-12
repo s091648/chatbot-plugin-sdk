@@ -1,6 +1,10 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
 import httpx
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+
+if TYPE_CHECKING:
+    from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
 
 
 class EndpointProvider:
@@ -15,14 +19,24 @@ class EndpointProvider:
         dimension: dense 向量的維度。使用 response_key="dense" 時必填；
                    response_key="sparse" 時可省略（sparse 無固定維度）。
         timeout: HTTP 請求 timeout（秒），預設 60。
+        rate_limit: 選填的 rate limiting 策略（如 ``SlidingWindowStrategy``）。
+                    使用外部 API（如 Google AI Studio）時建議設定；
+                    內部 service 或自架 model 可省略（傳 ``None``）。
 
     Usage::
 
-        # Dense（搭配 Google AI Studio 或 HuggingFace TEI）
-        dense = EndpointProvider(url="http://embed:8080", response_key="dense",
-                                 api_key="...", dimension=768)
+        from chatbot_plugin_sdk import EndpointProvider
+        from chatbot_plugin_sdk.rate_limit import SlidingWindowStrategy
 
-        # Sparse（搭配自架 SPLADE sidecar）
+        # 搭配 Google AI Studio（有 rpm/tpm/rpd 限制）
+        dense = EndpointProvider(
+            url="https://generativelanguage.googleapis.com/...",
+            dimension=768,
+            api_key="AIza...",
+            rate_limit=SlidingWindowStrategy(rpm=10, tpm=40_000, rpd=1_500),
+        )
+
+        # 內部 sidecar（無限流）
         sparse = EndpointProvider(url="http://embed:8080", response_key="sparse")
     """
 
@@ -33,6 +47,7 @@ class EndpointProvider:
         api_key: str | None = None,
         dimension: int | None = None,
         timeout: float = 60.0,
+        rate_limit: "RateLimitStrategy | None" = None,
     ) -> None:
         if response_key == "dense" and dimension is None:
             raise ValueError("dimension is required when response_key='dense'")
@@ -40,6 +55,7 @@ class EndpointProvider:
         self._response_key = response_key
         self._api_key = api_key
         self._timeout = timeout
+        self._rate_limit = rate_limit
         self.dimension: int = dimension or 0  # sparse 時為 0（不使用）
 
     def _build_client(self) -> httpx.AsyncClient:
@@ -54,6 +70,12 @@ class EndpointProvider:
         Request body: ``{"texts": ["text1", ...]}``
         Expected response: ``{"dense": [[...], ...], "sparse": [{...}, ...]}``
         """
+        # Estimate tokens: rough approximation (4 chars ≈ 1 token)
+        _estimated_tokens = 0
+        if self._rate_limit is not None:
+            _estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+            await self._rate_limit.acquire(_estimated_tokens)
+
         async with self._build_client() as client:
             try:
                 resp = await client.post("/embed", json={"texts": texts})
@@ -72,4 +94,8 @@ class EndpointProvider:
                 f"Embedding response missing key '{self._response_key}'. "
                 f"Available keys: {list(data.keys())}"
             )
+
+        if self._rate_limit is not None:
+            self._rate_limit.record_usage(_estimated_tokens)
+
         return result
