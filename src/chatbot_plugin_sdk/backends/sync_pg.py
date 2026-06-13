@@ -28,6 +28,8 @@ import uuid
 from sqlalchemy import create_engine, delete, inspect as sa_inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
+import logging
+
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_CREATE_CHUNKS,
@@ -47,6 +49,8 @@ from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.exceptions import DatabaseError
 from chatbot_plugin_sdk.models.article import Article
 from chatbot_plugin_sdk.models.chunk import ArticleChunk
+
+logger = logging.getLogger(__name__)
 
 
 class SyncPgBackend:
@@ -133,6 +137,12 @@ class SyncPgBackend:
                 )))
                 conn.execute(text(_DDL_IDX_URL.format(schema=schema)))
                 conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema)))
+                logger.info(
+                    "vector_tables_created",
+                    extra={"schema": schema, "dense_dim": dense_dim, "sparse_dim": sparse_dim},
+                )
+            else:
+                logger.debug("vector_tables_exist", extra={"schema": schema})
 
         # Validate dimensions outside the DDL transaction (separate connection)
         if table_existed and (dense_dim is not None or sparse_dim is not None):

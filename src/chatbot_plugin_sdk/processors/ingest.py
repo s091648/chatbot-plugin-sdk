@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 import uuid
@@ -9,6 +10,8 @@ from chatbot_plugin_sdk.backends.base import DatabaseBackend
 from chatbot_plugin_sdk.chunking import _chunk_text
 from chatbot_plugin_sdk.exceptions import DatabaseError, NotConfiguredError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
+
+logger = logging.getLogger(__name__)
 
 
 class IngestProcessor:
@@ -72,8 +75,10 @@ class IngestProcessor:
             raise NotConfiguredError("尚未呼叫 configure()。")
         dense_dim = self._dense.dimension if self._dense else None
         sparse_dim = self._sparse.dimension if self._sparse else None
+        logger.debug("vector_store_setup", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
         await self._backend.setup(dense_dim, sparse_dim)
         self._ready = True
+        logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -128,4 +133,9 @@ class IngestProcessor:
                 )
 
         article_id = uuid.uuid5(uuid.NAMESPACE_URL, url)
+        logger.debug("ingest_upserting", extra={"url": url, "chunk_count": len(chunks)})
         await self._backend.upsert(article_id, metadata, chunks, dense_vectors, sparse_vectors)
+        logger.info(
+            "ingest_complete",
+            extra={"url": url, "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
+        )

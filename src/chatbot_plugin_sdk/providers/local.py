@@ -1,7 +1,10 @@
 from __future__ import annotations
 import asyncio
+import logging
 from collections.abc import Callable
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+
+logger = logging.getLogger(__name__)
 
 
 class LocalProvider:
@@ -40,11 +43,15 @@ class LocalProvider:
 
     async def embed(self, texts: list[str]) -> list:
         """呼叫 fn(texts)，自動處理 sync/async 差異。"""
+        logger.debug("local_embedding_called", extra={"text_count": len(texts), "dimension": self.dimension})
         try:
             if asyncio.iscoroutinefunction(self._fn):
-                return await self._fn(texts)
+                result = await self._fn(texts)
             else:
                 loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, self._fn, texts)
+                result = await loop.run_in_executor(None, self._fn, texts)
+            logger.debug("local_embedding_done", extra={"vector_count": len(result)})
+            return result
         except Exception as exc:
+            logger.warning("local_embedding_failed", extra={"error": str(exc)})
             raise EmbeddingError(f"Local embedding function failed: {exc}") from exc

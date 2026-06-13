@@ -21,7 +21,15 @@ Quick start::
         dense=EndpointProvider(url="http://embed:8080", dimension=768),
     )
     await processor.ingest(full_text="...", metadata={"url": "https://...", "title": "..."})
+
+Logging:
+    This package follows PEP 396 — a NullHandler is added at the package level
+    so records are silently discarded unless the *application* configures a handler.
+    Applications should configure ``logging.getLogger("chatbot_plugin_sdk")``
+    to see SDK-level log output (INFO: ingest/setup events; DEBUG: per-request details).
 """
+import logging as _logging
+_logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from chatbot_plugin_sdk.processors.ingest import IngestProcessor
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor

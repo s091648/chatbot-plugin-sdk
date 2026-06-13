@@ -1,7 +1,10 @@
 from __future__ import annotations
+import logging
 from typing import TYPE_CHECKING
 import httpx
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
@@ -76,16 +79,25 @@ class EndpointProvider:
             _estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
             await self._rate_limit.acquire(_estimated_tokens)
 
+        logger.debug(
+            "embedding_request",
+            extra={"url": self._url, "response_key": self._response_key, "text_count": len(texts)},
+        )
         async with self._build_client() as client:
             try:
                 resp = await client.post("/embed", json={"texts": texts})
                 resp.raise_for_status()
                 data = resp.json()
             except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    "embedding_http_error",
+                    extra={"url": self._url, "status": exc.response.status_code},
+                )
                 raise EmbeddingError(
                     f"Embedding endpoint returned {exc.response.status_code}: {exc.response.text}"
                 ) from exc
             except Exception as exc:
+                logger.warning("embedding_request_failed", extra={"url": self._url, "error": str(exc)})
                 raise EmbeddingError(f"Embedding request failed: {exc}") from exc
 
         result = data.get(self._response_key)
