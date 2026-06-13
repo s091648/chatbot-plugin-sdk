@@ -1,0 +1,71 @@
+site_name: chatbot-plugin-sdk
+site_description: Python SDK for RAG article ingestion and semantic search over PostgreSQL + pgvector
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+
+nav:
+  - Home: index.md
+  - Quick Start: quickstart.md
+  - Guide:
+    - Choosing a Backend: guide/backends.md
+    - Embedding Providers: guide/providers.md
+  - API Reference:
+    - Processors: api/processors.md
+    - Backends: api/backends.md
+    - Providers: api/providers.md
+    - Config: api/config.md
+    - Rate Limiting: api/rate-limit.md
+    - Exceptions: api/exceptions.md
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            docstring_style: google
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
