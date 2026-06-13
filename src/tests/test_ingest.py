@@ -97,7 +97,7 @@ class TestEnsureReady:
         processor = IngestProcessor()
         processor.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
         await processor._ensure_ready()
-        backend.setup.assert_called_once_with(768)
+        backend.setup.assert_called_once_with(768, None)  # dense_dim=768, sparse_dim=None
         assert processor._ready is True
 
     @pytest.mark.asyncio

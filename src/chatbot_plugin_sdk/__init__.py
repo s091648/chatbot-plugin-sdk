@@ -45,6 +45,7 @@ from chatbot_plugin_sdk.rate_limit import (
     SlidingWindowStrategy,
     RateLimitExhausted,
 )
+from chatbot_plugin_sdk.rerankers import FastEmbedReranker, Reranker
 
 __all__ = [
     # Processors
@@ -66,6 +67,9 @@ __all__ = [
     # Protocols
     "DenseEmbeddingProvider",
     "SparseEmbeddingProvider",
+    # Rerankers
+    "Reranker",
+    "FastEmbedReranker",
     # Exceptions
     "ToolboxError",
     "NotConfiguredError",

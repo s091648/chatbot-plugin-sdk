@@ -37,15 +37,24 @@ class DatabaseBackend(Protocol):
 
     schema: str
 
-    async def setup(self, dense_dim: int | None) -> None:
+    async def setup(self, dense_dim: int | None, sparse_dim: int | None = None) -> None:
         """Idempotent.  Creates schema + tables if missing; validates dimension if existing.
+
+        Args:
+            dense_dim: VECTOR(N) dimension.  ``None`` → default VECTOR(768) placeholder.
+            sparse_dim: SPARSEVEC(N) vocabulary size (e.g. 30522 for BERT SPLADE).
+                        ``None`` → column stored as JSONB (sparse provider not configured).
 
         Called by :class:`IngestProcessor` on first use.
         """
         ...
 
-    async def validate(self, dense_dim: int | None) -> None:
+    async def validate(self, dense_dim: int | None, sparse_dim: int | None = None) -> None:
         """Read-only validation: tables must already exist.  Raises if missing.
+
+        Args:
+            dense_dim: Expected VECTOR dimension from the dense provider.
+            sparse_dim: Expected SPARSEVEC dimension from the sparse provider.
 
         Called by :class:`RetrieveProcessor` on first use.
         """
@@ -71,6 +80,19 @@ class DatabaseBackend(Protocol):
         top_k: int,
     ) -> list[SearchRow]:
         """Cosine similarity search on the dense_vector column."""
+        ...
+
+    async def search_sparse(
+        self,
+        query_vec: dict[str, float],
+        top_k: int,
+    ) -> list[SearchRow]:
+        """Maximum inner product search on the sparse_vector column (<#> operator).
+
+        ``distance`` in returned rows is the *negative* inner product (lower = more similar),
+        matching the same convention as ``search_dense`` so :func:`_rrf_merge` can treat both
+        lists uniformly by rank.
+        """
         ...
 
     async def close(self) -> None:

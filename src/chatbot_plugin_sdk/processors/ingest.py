@@ -71,7 +71,8 @@ class IngestProcessor:
         if self._backend is None:
             raise NotConfiguredError("尚未呼叫 configure()。")
         dense_dim = self._dense.dimension if self._dense else None
-        await self._backend.setup(dense_dim)
+        sparse_dim = self._sparse.dimension if self._sparse else None
+        await self._backend.setup(dense_dim, sparse_dim)
         self._ready = True
 
     @staticmethod

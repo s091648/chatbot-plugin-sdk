@@ -1,6 +1,6 @@
 """Tests for RetrieveProcessor."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -8,6 +8,7 @@ from chatbot_plugin_sdk import RetrieveProcessor, EndpointProvider, DatabaseBack
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.contracts.responses import SearchResponse
 from chatbot_plugin_sdk.exceptions import NotConfiguredError
+from chatbot_plugin_sdk.processors.retrieve import _rrf_merge
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -57,6 +58,13 @@ class TestRetrieveConfigure:
         )
         assert retriever._ready is False
 
+    def test_configure_with_reranker(self):
+        retriever = RetrieveProcessor()
+        dense = EndpointProvider(url="http://x", dimension=768)
+        reranker = MagicMock()
+        retriever.configure(backend=_mock_backend(), dense=dense, reranker=reranker)
+        assert retriever._reranker is reranker
+
 
 # ── _ensure_ready() ─────────────────────────────────────────────────────────────
 
@@ -67,7 +75,7 @@ class TestEnsureReady:
         retriever = RetrieveProcessor()
         retriever.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
         await retriever._ensure_ready()
-        backend.validate.assert_called_once_with(768)
+        backend.validate.assert_called_once_with(768, None)  # dense_dim=768, sparse_dim=None
         assert retriever._ready is True
 
     @pytest.mark.asyncio
@@ -86,7 +94,7 @@ class TestEnsureReady:
             await retriever._ensure_ready()
 
 
-# ── search() ───────────────────────────────────────────────────────────────────
+# ── retrieve() (dense-only) ────────────────────────────────────────────────────
 
 class TestRetrieve:
     @pytest.mark.asyncio
@@ -145,3 +153,132 @@ class TestRetrieve:
         backend.search_dense.assert_called_once()
         _, called_top_k = backend.search_dense.call_args.args
         assert called_top_k == 5
+
+
+# ── _rrf_merge() ──────────────────────────────────────────────────────────────
+
+class TestRrfMerge:
+    def test_unique_chunks_from_single_list(self):
+        rows = [_make_row(f"c{i}", "a1", i, "t", "T", "u") for i in range(3)]
+        merged = _rrf_merge(rows, [])
+        assert [r.chunk_id for r, _ in merged] == ["c0", "c1", "c2"]
+
+    def test_overlapping_chunk_gets_double_score(self):
+        r = _make_row("c1", "a1", 0, "t", "T", "u")
+        merged = _rrf_merge([r], [r])
+        assert len(merged) == 1
+        score = merged[0][1]
+        # Both lists give rank 0 → score = 2 * 1/(60+0+1) ≈ 0.03279
+        assert score == pytest.approx(2.0 / 61, rel=1e-5)
+
+    def test_nonoverlapping_merged_and_ordered_by_score(self):
+        dense  = [_make_row("d1", "a1", 0, "t", "T", "u")]
+        sparse = [_make_row("s1", "a1", 1, "t", "T", "u")]
+        merged = _rrf_merge(dense, sparse)
+        # Both get rank 0 in their respective lists → same RRF score → order is stable
+        assert len(merged) == 2
+        assert merged[0][1] == pytest.approx(merged[1][1], abs=1e-9)
+
+    def test_higher_ranked_item_wins(self):
+        # c1 is rank-0 in dense AND rank-1 in sparse → wins over c2 (rank-1 dense, rank-0 sparse)
+        c1 = _make_row("c1", "a1", 0, "t", "T", "u")
+        c2 = _make_row("c2", "a1", 1, "t", "T", "u")
+        merged = _rrf_merge([c1, c2], [c2, c1])
+        # Both get the same total score (rank 0 + rank 1 = rank 1 + rank 0), order is stable
+        ids = [r.chunk_id for r, _ in merged]
+        assert set(ids) == {"c1", "c2"}
+
+
+# ── hybrid retrieve() ─────────────────────────────────────────────────────────
+
+class TestHybridRetrieve:
+    def _make_sparse_provider(self, dimension=30522):
+        provider = MagicMock()
+        provider.dimension = dimension
+        provider.embed = AsyncMock(return_value=[{"0": 0.5, "1": 0.3}])
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_hybrid_calls_both_backends(self):
+        backend = _mock_backend()
+        backend.search_dense.return_value = [_make_row("c1", "a1", 0, "t", "T", "u", 0.1)]
+        backend.search_sparse.return_value = [_make_row("c2", "a2", 0, "t", "T", "u", -0.9)]
+
+        dense = EndpointProvider(url="http://x", dimension=768)
+        sparse = self._make_sparse_provider()
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, sparse=sparse)
+        retriever._ready = True
+
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", top_k=5)
+
+        backend.search_dense.assert_called_once()
+        backend.search_sparse.assert_called_once()
+        assert isinstance(result, SearchResponse)
+        assert len(result.chunks) == 2
+
+    @pytest.mark.asyncio
+    async def test_hybrid_uses_rrf_scores(self):
+        backend = _mock_backend()
+        row = _make_row("c1", "a1", 0, "t", "T", "u", 0.1)
+        backend.search_dense.return_value = [row]
+        backend.search_sparse.return_value = [row]  # same chunk in both → higher RRF score
+
+        dense = EndpointProvider(url="http://x", dimension=768)
+        sparse = self._make_sparse_provider()
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, sparse=sparse)
+        retriever._ready = True
+
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q")
+
+        # Score must be RRF score ≈ 2/61, not 1 − distance
+        assert result.chunks[0].score == pytest.approx(2.0 / 61, rel=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_reranker_overrides_scores(self):
+        backend = _mock_backend()
+        row1 = _make_row("c1", "a1", 0, "first", "T", "u", 0.1)
+        row2 = _make_row("c2", "a2", 0, "second", "T", "u", 0.3)
+        backend.search_dense.return_value = [row1, row2]
+
+        dense = EndpointProvider(url="http://x", dimension=768)
+        reranker = MagicMock()
+        # reranker reverses order and assigns explicit scores
+        reranker.rerank = AsyncMock(return_value=[(row2, 0.95), (row1, 0.42)])
+
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, reranker=reranker)
+        retriever._ready = True
+
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", top_k=2)
+
+        assert result.chunks[0].chunk_id == "c2"
+        assert result.chunks[0].score == pytest.approx(0.95)
+        assert result.chunks[1].chunk_id == "c1"
+        assert result.chunks[1].score == pytest.approx(0.42)
+
+    @pytest.mark.asyncio
+    async def test_reranker_fetches_3x_candidates(self):
+        backend = _mock_backend()
+        backend.search_dense.return_value = []
+        reranker = MagicMock()
+        reranker.rerank = AsyncMock(return_value=[])
+
+        dense = EndpointProvider(url="http://x", dimension=768)
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, reranker=reranker)
+        retriever._ready = True
+
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            await retriever.retrieve("q", top_k=5)
+
+        _, called_k = backend.search_dense.call_args.args
+        assert called_k == 15  # top_k * 3

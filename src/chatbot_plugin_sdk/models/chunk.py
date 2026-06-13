@@ -1,7 +1,7 @@
 from sqlalchemy import Column, ForeignKey, Integer, Text, DateTime, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
-from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy import SPARSEVEC, Vector
 
 from chatbot_plugin_sdk.models.article import Base
 
@@ -21,10 +21,10 @@ class ArticleChunk(Base):
     )
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
-    # nullable: 只配置 dense 時 sparse 為 NULL，反之亦然
-    # Vector(768) 是 ORM placeholder；實際維度由 IngestProcessor._create_tables() 動態決定
+    # ORM placeholder — actual dimension determined by DDL at setup() time.
+    # Vector(768): BERT-class default; SparseVector(30522): BERT vocab size (SPLADE).
     dense_vector = Column(Vector(768), nullable=True)
-    sparse_vector = Column(JSONB, nullable=True)
+    sparse_vector = Column(SPARSEVEC(30522), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     article = relationship("Article", back_populates="chunks")
