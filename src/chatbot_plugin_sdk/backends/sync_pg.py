@@ -25,10 +25,21 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy import create_engine, delete, inspect as sa_inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
-from chatbot_plugin_sdk.backends.base import SearchRow
+from chatbot_plugin_sdk.backends.base import (
+    SearchRow,
+    _DDL_CREATE_CHUNKS,
+    _DDL_CREATE_ARTICLES,
+    _DDL_CREATE_EXTENSION,
+    _DDL_CREATE_SCHEMA,
+    _DDL_IDX_SOURCE,
+    _DDL_IDX_URL,
+    _DDL_TABLE_EXISTS,
+    _check_dim_from_cols,
+    _dense_col_ddl,
+)
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.exceptions import DatabaseError
 from chatbot_plugin_sdk.models.article import Article
@@ -96,87 +107,43 @@ class SyncPgBackend:
     # ── Sync implementations ────────────────────────────────────────────────
 
     def _setup_sync(self, dense_dim: int | None) -> None:
+        """Create schema + tables if missing; validate dimension if table already existed."""
         schema = self.schema
         with self._engine.begin() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
-            r = conn.execute(text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema=:s AND table_name='article_chunks'"
-            ), {"s": schema})
+            conn.execute(text(_DDL_CREATE_EXTENSION))
+            conn.execute(text(_DDL_CREATE_SCHEMA.format(schema=schema)))
+            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
             table_existed = r.fetchone() is not None
-
             if not table_existed:
-                dense_col = (
-                    f"dense_vector VECTOR({dense_dim})" if dense_dim else "dense_vector VECTOR(768)"
-                )
-                conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {schema}.articles (
-                        id         UUID PRIMARY KEY,
-                        url        TEXT NOT NULL UNIQUE,
-                        title      TEXT,
-                        source     TEXT,
-                        metadata   JSONB,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    )
-                """))
-                conn.execute(text(f"""
-                    CREATE TABLE IF NOT EXISTS {schema}.article_chunks (
-                        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                        article_id    UUID NOT NULL
-                                      REFERENCES {schema}.articles(id) ON DELETE CASCADE,
-                        chunk_index   INTEGER NOT NULL,
-                        content       TEXT NOT NULL,
-                        {dense_col},
-                        sparse_vector JSONB,
-                        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        CONSTRAINT uq_article_chunk_idx UNIQUE (article_id, chunk_index)
-                    )
-                """))
-                conn.execute(text(
-                    f"CREATE INDEX IF NOT EXISTS idx_articles_url ON {schema}.articles(url)"
-                ))
-                conn.execute(text(
-                    f"CREATE INDEX IF NOT EXISTS idx_articles_source ON {schema}.articles(source)"
-                ))
+                dense_col = _dense_col_ddl(dense_dim)
+                conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema)))
+                conn.execute(text(_DDL_CREATE_CHUNKS.format(schema=schema, dense_col=dense_col)))
+                conn.execute(text(_DDL_IDX_URL.format(schema=schema)))
+                conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema)))
 
         # Validate dimension outside the DDL transaction (separate connection)
         if table_existed and dense_dim is not None:
-            self._check_dim_compat_sync(dense_dim)
-
-    def _check_dim_compat_sync(self, dense_dim: int) -> None:
-        from sqlalchemy import inspect as sa_inspect
-        inspector = sa_inspect(self._engine)
-        try:
-            cols = inspector.get_columns("article_chunks", schema=self.schema)
-        except Exception:
-            return  # table may not exist yet (race condition at startup — harmless)
-        for col in cols:
-            if col["name"] == "dense_vector":
-                db_dim = getattr(col["type"], "dim", None)
-                if db_dim is not None and db_dim != dense_dim:
-                    raise DatabaseError(
-                        f"Dimension mismatch: DB has VECTOR({db_dim}) "
-                        f"but provider.dimension={dense_dim}. "
-                        "Use the same embedding model that created the table."
-                    )
-                break
+            self._check_dim(dense_dim)
 
     def _validate_sync(self, dense_dim: int | None) -> None:
         schema = self.schema
         with self._engine.connect() as conn:
-            r = conn.execute(text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema=:s AND table_name='article_chunks'"
-            ), {"s": schema})
+            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
             if r.fetchone() is None:
                 raise DatabaseError(
                     f"Table {schema}.article_chunks not found. "
                     "Run IngestProcessor first to create the schema."
                 )
         if dense_dim is not None:
-            self._check_dim_compat_sync(dense_dim)
+            self._check_dim(dense_dim)
+
+    def _check_dim(self, dense_dim: int) -> None:
+        """Validate that the existing VECTOR column dimension matches dense_dim."""
+        try:
+            cols = sa_inspect(self._engine).get_columns("article_chunks", schema=self.schema)
+        except Exception:
+            return  # table may not exist yet (race condition at startup — harmless)
+        _check_dim_from_cols(cols, dense_dim)
 
     def _upsert_sync(
         self,

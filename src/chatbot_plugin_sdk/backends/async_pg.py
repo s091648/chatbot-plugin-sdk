@@ -14,10 +14,21 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, inspect as sa_inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from chatbot_plugin_sdk.backends.base import SearchRow
+from chatbot_plugin_sdk.backends.base import (
+    SearchRow,
+    _DDL_CREATE_CHUNKS,
+    _DDL_CREATE_ARTICLES,
+    _DDL_CREATE_EXTENSION,
+    _DDL_CREATE_SCHEMA,
+    _DDL_IDX_SOURCE,
+    _DDL_IDX_URL,
+    _DDL_TABLE_EXISTS,
+    _check_dim_from_cols,
+    _dense_col_ddl,
+)
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.exceptions import DatabaseError
 from chatbot_plugin_sdk.models.article import Article
@@ -43,104 +54,19 @@ class AsyncPgBackend:
     # ── Setup / validation ─────────────────────────────────────────────────
 
     async def setup(self, dense_dim: int | None) -> None:
-        schema = self.schema
-        table_existed = await self._ensure_tables(dense_dim)
-        if table_existed and dense_dim is not None:
-            await self._check_dim_compat(dense_dim)
-
-    async def _ensure_tables(self, dense_dim: int | None) -> bool:
-        """Create schema + tables if missing.  Returns True if table already existed."""
-        schema = self.schema
-        async with self._engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
-            r = await conn.execute(text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema=:s AND table_name='article_chunks'"
-            ), {"s": schema})
-            if r.fetchone() is not None:
-                return True  # table exists — skip creation
-
-            dense_col = f"dense_vector VECTOR({dense_dim})" if dense_dim else "dense_vector VECTOR(768)"
-            await conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS {schema}.articles (
-                    id         UUID PRIMARY KEY,
-                    url        TEXT NOT NULL UNIQUE,
-                    title      TEXT,
-                    source     TEXT,
-                    metadata   JSONB,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-            """))
-            await conn.execute(text(f"""
-                CREATE TABLE IF NOT EXISTS {schema}.article_chunks (
-                    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    article_id    UUID NOT NULL
-                                  REFERENCES {schema}.articles(id) ON DELETE CASCADE,
-                    chunk_index   INTEGER NOT NULL,
-                    content       TEXT NOT NULL,
-                    {dense_col},
-                    sparse_vector JSONB,
-                    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    CONSTRAINT uq_article_chunk_idx UNIQUE (article_id, chunk_index)
-                )
-            """))
-            await conn.execute(text(
-                f"CREATE INDEX IF NOT EXISTS idx_articles_url ON {schema}.articles(url)"
-            ))
-            await conn.execute(text(
-                f"CREATE INDEX IF NOT EXISTS idx_articles_source ON {schema}.articles(source)"
-            ))
-            return False
-
-    async def _check_dim_compat(self, dense_dim: int) -> None:
-        async with self._engine.connect() as conn:
-            def _get_dim(sync_conn):
-                from sqlalchemy import inspect as sa_inspect
-                inspector = sa_inspect(sync_conn)
-                cols = inspector.get_columns("article_chunks", schema=self.schema)
-                for col in cols:
-                    if col["name"] == "dense_vector":
-                        return getattr(col["type"], "dim", None)
-                return None
-
-            db_dim = await conn.run_sync(_get_dim)
-        if db_dim is not None and db_dim != dense_dim:
-            raise DatabaseError(
-                f"Dimension mismatch: DB has VECTOR({db_dim}) "
-                f"but provider.dimension={dense_dim}. "
-                "Use the same embedding model that created the table."
-            )
+        await self._setup_ddl(dense_dim)
 
     async def validate(self, dense_dim: int | None) -> None:
         schema = self.schema
         async with self._engine.connect() as conn:
-            r = await conn.execute(text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema=:s AND table_name='article_chunks'"
-            ), {"s": schema})
+            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
             if r.fetchone() is None:
                 raise DatabaseError(
                     f"Table {schema}.article_chunks not found. "
                     "Run IngestProcessor first to create the schema."
                 )
-            if dense_dim is not None:
-                def _get_dim(sync_conn):
-                    from sqlalchemy import inspect as sa_inspect
-                    inspector = sa_inspect(sync_conn)
-                    cols = inspector.get_columns("article_chunks", schema=schema)
-                    for col in cols:
-                        if col["name"] == "dense_vector":
-                            return getattr(col["type"], "dim", None)
-                    return None
-
-                db_dim = await conn.run_sync(_get_dim)
-                if db_dim is not None and db_dim != dense_dim:
-                    raise DatabaseError(
-                        f"Dimension mismatch: DB has VECTOR({db_dim}) "
-                        f"but provider.dimension={dense_dim}."
-                    )
+        if dense_dim is not None:
+            await self._check_dim(dense_dim)
 
     # ── Write ──────────────────────────────────────────────────────────────
 
@@ -230,3 +156,37 @@ class AsyncPgBackend:
     async def close(self) -> None:
         """Dispose all pooled connections.  Call on application shutdown."""
         await self._engine.dispose()
+
+    # ── Private helpers ────────────────────────────────────────────────────
+
+    async def _setup_ddl(self, dense_dim: int | None) -> None:
+        """Create schema + tables if missing; validate dimension if table already existed."""
+        schema = self.schema
+        async with self._engine.begin() as conn:
+            await conn.execute(text(_DDL_CREATE_EXTENSION))
+            await conn.execute(text(_DDL_CREATE_SCHEMA.format(schema=schema)))
+            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
+            table_existed = r.fetchone() is not None
+            if not table_existed:
+                dense_col = _dense_col_ddl(dense_dim)
+                await conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema)))
+                await conn.execute(text(_DDL_CREATE_CHUNKS.format(schema=schema, dense_col=dense_col)))
+                await conn.execute(text(_DDL_IDX_URL.format(schema=schema)))
+                await conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema)))
+
+        if table_existed and dense_dim is not None:
+            await self._check_dim(dense_dim)
+
+    async def _check_dim(self, dense_dim: int) -> None:
+        """Validate that the existing VECTOR column dimension matches dense_dim.
+
+        Uses run_sync because SQLAlchemy's async engine requires bridging to the
+        sync inspector API to introspect column types.
+        """
+        async with self._engine.connect() as conn:
+            await conn.run_sync(
+                lambda sync_conn: _check_dim_from_cols(
+                    sa_inspect(sync_conn).get_columns("article_chunks", schema=self.schema),
+                    dense_dim,
+                )
+            )
