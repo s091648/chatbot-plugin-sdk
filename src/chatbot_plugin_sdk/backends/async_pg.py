@@ -17,8 +17,8 @@ import uuid
 from sqlalchemy import delete, inspect as sa_inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from chatbot_plugin_sdk.backends.base import (
-    SearchRow,
+from chatbot_plugin_sdk.backends.base import SearchRow
+from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_CREATE_CHUNKS,
     _DDL_CREATE_ARTICLES,
     _DDL_CREATE_EXTENSION,

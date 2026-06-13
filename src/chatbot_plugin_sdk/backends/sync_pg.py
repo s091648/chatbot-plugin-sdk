@@ -28,8 +28,8 @@ import uuid
 from sqlalchemy import create_engine, delete, inspect as sa_inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
-from chatbot_plugin_sdk.backends.base import (
-    SearchRow,
+from chatbot_plugin_sdk.backends.base import SearchRow
+from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_CREATE_CHUNKS,
     _DDL_CREATE_ARTICLES,
     _DDL_CREATE_EXTENSION,
