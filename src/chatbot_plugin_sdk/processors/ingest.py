@@ -64,7 +64,7 @@ class IngestProcessor:
         self._sparse = sparse
         self._ready = False
 
-    async def ensure_ready(self) -> None:
+    async def _ensure_ready(self) -> None:
         """Idempotent first-use initialisation — delegates to backend.setup()."""
         if self._ready:
             return
@@ -92,7 +92,7 @@ class IngestProcessor:
             metadata:  Must contain ``url`` (str) for idempotent upsert keying.
                        Also accepts ``title`` and ``source``.
         """
-        await self.ensure_ready()
+        await self._ensure_ready()
 
         metadata = metadata or {}
         url = metadata.get("url", "")

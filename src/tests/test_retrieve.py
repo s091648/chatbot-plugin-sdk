@@ -23,7 +23,7 @@ def _configured_retriever(backend=None) -> tuple[RetrieveProcessor, AsyncMock]:
     dense = EndpointProvider(url="http://localhost:8080", dimension=768)
     retriever = RetrieveProcessor()
     retriever.configure(backend=backend, dense=dense)
-    retriever._ready = True  # bypass ensure_ready() / backend.validate()
+    retriever._ready = True  # bypass _ensure_ready() / backend.validate()
     return retriever, backend
 
 
@@ -58,7 +58,7 @@ class TestRetrieveConfigure:
         assert retriever._ready is False
 
 
-# ── ensure_ready() ─────────────────────────────────────────────────────────────
+# ── _ensure_ready() ─────────────────────────────────────────────────────────────
 
 class TestEnsureReady:
     @pytest.mark.asyncio
@@ -66,7 +66,7 @@ class TestEnsureReady:
         backend = _mock_backend()
         retriever = RetrieveProcessor()
         retriever.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
-        await retriever.ensure_ready()
+        await retriever._ensure_ready()
         backend.validate.assert_called_once_with(768)
         assert retriever._ready is True
 
@@ -76,14 +76,14 @@ class TestEnsureReady:
         retriever = RetrieveProcessor()
         retriever.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
         retriever._ready = True
-        await retriever.ensure_ready()
+        await retriever._ensure_ready()
         backend.validate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_configured(self):
         retriever = RetrieveProcessor()
         with pytest.raises(NotConfiguredError):
-            await retriever.ensure_ready()
+            await retriever._ensure_ready()
 
 
 # ── search() ───────────────────────────────────────────────────────────────────

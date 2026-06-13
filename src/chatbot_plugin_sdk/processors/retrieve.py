@@ -47,7 +47,7 @@ class RetrieveProcessor:
         self._sparse = sparse
         self._ready = False
 
-    async def ensure_ready(self) -> None:
+    async def _ensure_ready(self) -> None:
         """Validate tables exist + dimension compatible — delegates to backend.validate()."""
         if self._ready:
             return
@@ -65,7 +65,7 @@ class RetrieveProcessor:
         Returns:
             :class:`SearchResponse` with chunks ordered by descending similarity.
         """
-        await self.ensure_ready()
+        await self._ensure_ready()
 
         if self._dense is not None:
             dense_vecs = await self._dense.embed([query])

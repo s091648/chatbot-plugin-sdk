@@ -27,7 +27,7 @@ def _configured_processor(backend=None) -> tuple[IngestProcessor, AsyncMock]:
     dense = EndpointProvider(url="http://localhost:8080", dimension=768)
     processor = IngestProcessor()
     processor.configure(backend=backend, dense=dense)
-    processor._ready = True  # bypass ensure_ready() / backend.setup()
+    processor._ready = True  # bypass _ensure_ready() / backend.setup()
     return processor, backend
 
 
@@ -88,7 +88,7 @@ class TestIngestConfigure:
         assert processor._ready is False
 
 
-# ── ensure_ready() ─────────────────────────────────────────────────────────────
+# ── _ensure_ready() ─────────────────────────────────────────────────────────────
 
 class TestEnsureReady:
     @pytest.mark.asyncio
@@ -96,7 +96,7 @@ class TestEnsureReady:
         backend = _mock_backend()
         processor = IngestProcessor()
         processor.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
-        await processor.ensure_ready()
+        await processor._ensure_ready()
         backend.setup.assert_called_once_with(768)
         assert processor._ready is True
 
@@ -106,14 +106,14 @@ class TestEnsureReady:
         processor = IngestProcessor()
         processor.configure(backend=backend, dense=EndpointProvider(url="http://x", dimension=768))
         processor._ready = True
-        await processor.ensure_ready()
+        await processor._ensure_ready()
         backend.setup.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_raises_when_not_configured(self):
         processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
-            await processor.ensure_ready()
+            await processor._ensure_ready()
 
 
 # ── ingest() ───────────────────────────────────────────────────────────────────
