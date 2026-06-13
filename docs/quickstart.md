@@ -74,7 +74,7 @@ async def ingest(url: str, text: str, title: str = ""):
 
 @app.get("/search")
 async def search(q: str, top_k: int = 5):
-    result = await retriever.search(q, top_k=top_k)
+    result = await retriever.retrieve(q, top_k=top_k)
     return result
 ```
 
@@ -156,7 +156,7 @@ processor.configure(backend=backend, dense=provider)
 Once articles are ingested:
 
 ```python
-result = await retriever.search("What is retrieval-augmented generation?", top_k=5)
+result = await retriever.retrieve("What is retrieval-augmented generation?", top_k=5)
 
 for chunk in result.chunks:
     print(f"[{chunk.score:.3f}] {chunk.article_title} — {chunk.content[:120]}")

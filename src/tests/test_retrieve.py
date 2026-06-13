@@ -88,12 +88,12 @@ class TestEnsureReady:
 
 # ── search() ───────────────────────────────────────────────────────────────────
 
-class TestRetrieveSearch:
+class TestRetrieve:
     @pytest.mark.asyncio
     async def test_raises_without_configure(self):
         retriever = RetrieveProcessor()
         with pytest.raises(NotConfiguredError):
-            await retriever.search("hello")
+            await retriever.retrieve("hello")
 
     @pytest.mark.asyncio
     async def test_returns_search_response(self):
@@ -104,7 +104,7 @@ class TestRetrieveSearch:
         ]
         with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.return_value = [[0.1] * 768]
-            result = await retriever.search("What is RAG?", top_k=2)
+            result = await retriever.retrieve("What is RAG?", top_k=2)
 
         assert isinstance(result, SearchResponse)
         assert len(result.chunks) == 2
@@ -120,7 +120,7 @@ class TestRetrieveSearch:
         ]
         with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.return_value = [[0.1] * 768]
-            result = await retriever.search("q")
+            result = await retriever.retrieve("q")
 
         assert result.chunks[0].score == pytest.approx(0.6, abs=1e-4)
 
@@ -130,7 +130,7 @@ class TestRetrieveSearch:
         backend.search_dense.return_value = []
         with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.return_value = [[0.1] * 768]
-            result = await retriever.search("unknown query")
+            result = await retriever.retrieve("unknown query")
 
         assert result.chunks == []
 
@@ -140,7 +140,7 @@ class TestRetrieveSearch:
         backend.search_dense.return_value = []
         with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.return_value = [[0.1] * 768]
-            await retriever.search("q", top_k=5)
+            await retriever.retrieve("q", top_k=5)
 
         backend.search_dense.assert_called_once()
         _, called_top_k = backend.search_dense.call_args.args

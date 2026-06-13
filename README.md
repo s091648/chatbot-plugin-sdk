@@ -39,7 +39,7 @@ await ingestor.ingest(
 retriever = RetrieveProcessor()
 retriever.configure(backend=backend, dense=provider)
 
-result = await retriever.search("What is RAG?", top_k=5)
+result = await retriever.retrieve("What is RAG?", top_k=5)
 for chunk in result.chunks:
     print(chunk.score, chunk.content[:80])
 ```

@@ -57,13 +57,13 @@ class RetrieveProcessor:
         await self._backend.validate(dense_dim)
         self._ready = True
 
-    async def search(self, query: str, top_k: int = 10) -> SearchResponse:
-        """Semantic search.
+    async def retrieve(self, query: str, top_k: int = 10) -> SearchResponse:
+        """Retrieve the top-k chunks most semantically similar to the query.
 
-        Currently supports dense-only search.  Sparse / hybrid pending.
+        Currently supports dense-only retrieval.  Sparse / hybrid pending.
 
         Returns:
-            :class:`SearchResponse` with chunks ordered by descending similarity.
+            :class:`SearchResponse` with chunks ordered by descending similarity score.
         """
         await self._ensure_ready()
 
@@ -85,6 +85,6 @@ class RetrieveProcessor:
             return SearchResponse(chunks=chunks)
 
         raise NotConfiguredError(
-            "Dense provider is required for search in this version. "
-            "Sparse-only and hybrid search are not yet implemented."
+            "Dense provider is required for retrieval in this version. "
+            "Sparse-only and hybrid retrieval are not yet implemented."
         )

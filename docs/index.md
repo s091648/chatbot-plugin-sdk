@@ -12,7 +12,7 @@ Python SDK for vector-based RAG — article ingestion and semantic search over *
                                                        │
                                               cosine similarity
                                                        │
-┌─────────────┐  RetrieveProcessor.search()  ┌────────▼─────────┐
+┌─────────────┐  RetrieveProcessor.retrieve()  ┌────────▼─────────┐
 │ User query  │ ◄────────────────────────── │  top-k chunks    │
 └─────────────┘  embed query → rank results  └──────────────────┘
 ```
@@ -66,7 +66,7 @@ await ingestor.ingest(
 retriever = RetrieveProcessor()
 retriever.configure(backend=backend, dense=provider)
 
-result = await retriever.search("What is RAG?", top_k=5)
+result = await retriever.retrieve("What is RAG?", top_k=5)
 for chunk in result.chunks:
     print(chunk.score, chunk.content[:80])
 ```
