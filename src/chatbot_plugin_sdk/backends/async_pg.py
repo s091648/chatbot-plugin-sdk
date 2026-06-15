@@ -12,9 +12,10 @@ Usage::
 """
 from __future__ import annotations
 
+import json
 import uuid
 
-from sqlalchemy import delete, inspect as sa_inspect, select, text
+from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from chatbot_plugin_sdk.backends.base import SearchRow
@@ -26,16 +27,20 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_IDX_SOURCE,
     _DDL_IDX_URL,
     _DDL_TABLE_EXISTS,
+    _DML_DELETE_CHUNKS,
+    _DML_INSERT_CHUNK,
+    _DML_UPSERT_ARTICLE,
+    _DQL_SEARCH_DENSE,
+    _DQL_SEARCH_SPARSE,
     _check_dim_from_cols,
     _check_sparse_dim_from_cols,
     _dense_col_ddl,
+    _dense_vec_str,
     _sparse_col_ddl,
     _to_sparsevec_string,
 )
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.exceptions import DatabaseError
-from chatbot_plugin_sdk.models.article import Article
-from chatbot_plugin_sdk.models.chunk import ArticleChunk
 
 
 class AsyncPgBackend:
@@ -53,6 +58,8 @@ class AsyncPgBackend:
             self._engine, class_=AsyncSession, expire_on_commit=False
         )
         self.schema = config.schema
+        self.articles_table = config.articles_table
+        self.chunks_table = config.chunks_table
         self._sparse_dim: int | None = None
 
     # ── Setup / validation ─────────────────────────────────────────────────
@@ -64,11 +71,12 @@ class AsyncPgBackend:
     async def validate(self, dense_dim: int | None, sparse_dim: int | None = None) -> None:
         self._sparse_dim = sparse_dim
         schema = self.schema
+        ct = self.chunks_table
         async with self._engine.connect() as conn:
-            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
+            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema, "t": ct})
             if r.fetchone() is None:
                 raise DatabaseError(
-                    f"Table {schema}.article_chunks not found. "
+                    f"Table {schema}.{ct} not found. "
                     "Run IngestProcessor first to create the schema."
                 )
         if dense_dim is not None or sparse_dim is not None:
@@ -84,71 +92,58 @@ class AsyncPgBackend:
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
     ) -> None:
-        session = self._session_factory()
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
         try:
-            async with session.begin():
-                existing = (await session.execute(
-                    select(Article).where(Article.id == article_id)
-                )).scalar_one_or_none()
-
-                if existing is not None:
-                    existing.url = metadata.get("url", "")
-                    existing.title = metadata.get("title")
-                    existing.source = metadata.get("source")
-                    existing.metadata_ = metadata.get("metadata")
-                    await session.execute(
-                        delete(ArticleChunk).where(ArticleChunk.article_id == article_id)
-                    )
-                else:
-                    session.add(Article(
-                        id=article_id,
-                        url=metadata.get("url", ""),
-                        title=metadata.get("title"),
-                        source=metadata.get("source"),
-                        metadata_=metadata.get("metadata"),
-                    ))
-
+            async with self._engine.begin() as conn:
+                await conn.execute(
+                    text(_DML_UPSERT_ARTICLE.format(schema=schema, articles_table=at)),
+                    {
+                        "id": str(article_id),
+                        "url": metadata.get("url", ""),
+                        "title": metadata.get("title"),
+                        "source": metadata.get("source"),
+                        "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
+                    },
+                )
+                await conn.execute(
+                    text(_DML_DELETE_CHUNKS.format(schema=schema, chunks_table=ct)),
+                    {"article_id": str(article_id)},
+                )
                 for i, content in enumerate(chunks):
-                    sparse_val = None
-                    if sparse_vectors is not None and self._sparse_dim:
-                        sparse_val = _to_sparsevec_string(sparse_vectors[i], self._sparse_dim)
-                    session.add(ArticleChunk(
-                        article_id=article_id,
-                        chunk_index=i,
-                        content=content,
-                        dense_vector=dense_vectors[i] if dense_vectors else None,
-                        sparse_vector=sparse_val,
-                    ))
+                    dense_val = _dense_vec_str(dense_vectors[i]) if dense_vectors else None
+                    sparse_val = (
+                        _to_sparsevec_string(sparse_vectors[i], self._sparse_dim)
+                        if sparse_vectors is not None and self._sparse_dim
+                        else None
+                    )
+                    await conn.execute(
+                        text(_DML_INSERT_CHUNK.format(schema=schema, chunks_table=ct)),
+                        {
+                            "article_id": str(article_id),
+                            "chunk_index": i,
+                            "content": content,
+                            "dense_vector": dense_val,
+                            "sparse_vector": sparse_val,
+                        },
+                    )
         except DatabaseError:
             raise
         except Exception as exc:
             raise DatabaseError(f"Upsert failed for article {article_id}: {exc}") from exc
-        finally:
-            await session.close()
 
-    async def search_sparse(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
-        """Inner-product search on the SPARSEVEC column using the <#> operator."""
-        if not self._sparse_dim:
-            return []
-        sv_str = _to_sparsevec_string(query_vec, self._sparse_dim)
-        async with self._session_factory() as db:
-            stmt = (
-                select(
-                    ArticleChunk.id.label("chunk_id"),
-                    ArticleChunk.article_id,
-                    ArticleChunk.chunk_index,
-                    ArticleChunk.content,
-                    Article.title,
-                    Article.url,
-                    ArticleChunk.sparse_vector.max_inner_product(sv_str).label("distance"),
-                )
-                .join(Article, ArticleChunk.article_id == Article.id)
-                .where(ArticleChunk.sparse_vector.isnot(None))
-                .order_by("distance")  # <#> returns negative inner product; ASC = most similar first
-                .limit(top_k)
-            )
-            rows = (await db.execute(stmt)).all()
+    # ── Read ───────────────────────────────────────────────────────────────
 
+    async def search_dense(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(
+                text(_DQL_SEARCH_DENSE.format(schema=schema, articles_table=at, chunks_table=ct)),
+                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k},
+            )).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),
@@ -162,27 +157,18 @@ class AsyncPgBackend:
             for r in rows
         ]
 
-    # ── Read ───────────────────────────────────────────────────────────────
-
-    async def search_dense(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
-        async with self._session_factory() as db:
-            stmt = (
-                select(
-                    ArticleChunk.id.label("chunk_id"),
-                    ArticleChunk.article_id,
-                    ArticleChunk.chunk_index,
-                    ArticleChunk.content,
-                    Article.title,
-                    Article.url,
-                    ArticleChunk.dense_vector.cosine_distance(query_vec).label("distance"),
-                )
-                .join(Article, ArticleChunk.article_id == Article.id)
-                .where(ArticleChunk.dense_vector.isnot(None))
-                .order_by("distance")
-                .limit(top_k)
-            )
-            rows = (await db.execute(stmt)).all()
-
+    async def search_sparse(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
+        if not self._sparse_dim:
+            return []
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
+        sv_str = _to_sparsevec_string(query_vec, self._sparse_dim)
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(
+                text(_DQL_SEARCH_SPARSE.format(schema=schema, articles_table=at, chunks_table=ct)),
+                {"query_vec": sv_str, "top_k": top_k},
+            )).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),
@@ -199,43 +185,38 @@ class AsyncPgBackend:
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        """Dispose all pooled connections.  Call on application shutdown."""
         await self._engine.dispose()
 
     # ── Private helpers ────────────────────────────────────────────────────
 
     async def _setup_ddl(self, dense_dim: int | None, sparse_dim: int | None) -> None:
-        """Create schema + tables if missing; validate dimensions if table already existed."""
         schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
         async with self._engine.begin() as conn:
             await conn.execute(text(_DDL_CREATE_EXTENSION))
             await conn.execute(text(_DDL_CREATE_SCHEMA.format(schema=schema)))
-            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
+            r = await conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema, "t": ct})
             table_existed = r.fetchone() is not None
             if not table_existed:
                 dense_col = _dense_col_ddl(dense_dim)
                 sparse_col = _sparse_col_ddl(sparse_dim)
-                await conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema)))
+                await conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema, articles_table=at)))
                 await conn.execute(text(_DDL_CREATE_CHUNKS.format(
-                    schema=schema, dense_col=dense_col, sparse_col=sparse_col,
+                    schema=schema, articles_table=at, chunks_table=ct,
+                    dense_col=dense_col, sparse_col=sparse_col,
                 )))
-                await conn.execute(text(_DDL_IDX_URL.format(schema=schema)))
-                await conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema)))
+                await conn.execute(text(_DDL_IDX_URL.format(schema=schema, articles_table=at)))
+                await conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema, articles_table=at)))
 
         if table_existed and (dense_dim is not None or sparse_dim is not None):
             await self._check_dim(dense_dim, sparse_dim)
 
     async def _check_dim(self, dense_dim: int | None, sparse_dim: int | None) -> None:
-        """Validate that existing column dimensions match the configured providers.
-
-        Uses run_sync because SQLAlchemy's async engine requires bridging to the
-        sync inspector API to introspect column types.
-        """
+        ct = self.chunks_table
         async with self._engine.connect() as conn:
             cols = await conn.run_sync(
-                lambda sync_conn: sa_inspect(sync_conn).get_columns(
-                    "article_chunks", schema=self.schema
-                )
+                lambda sync_conn: sa_inspect(sync_conn).get_columns(ct, schema=self.schema)
             )
         if dense_dim is not None:
             _check_dim_from_cols(cols, dense_dim)

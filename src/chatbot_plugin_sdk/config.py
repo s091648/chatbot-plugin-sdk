@@ -11,3 +11,5 @@ class DatabaseConfig:
     host: str = "localhost"
     port: int = 5432
     schema: str = "vectors"
+    articles_table: str = "articles"
+    chunks_table: str = "article_chunks"

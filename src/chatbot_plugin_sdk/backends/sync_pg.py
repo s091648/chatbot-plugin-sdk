@@ -23,9 +23,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
-from sqlalchemy import create_engine, delete, inspect as sa_inspect, select, text
+from sqlalchemy import create_engine, inspect as sa_inspect, text
 from sqlalchemy.orm import sessionmaker
 
 import logging
@@ -39,16 +40,20 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_IDX_SOURCE,
     _DDL_IDX_URL,
     _DDL_TABLE_EXISTS,
+    _DML_DELETE_CHUNKS,
+    _DML_INSERT_CHUNK,
+    _DML_UPSERT_ARTICLE,
+    _DQL_SEARCH_DENSE,
+    _DQL_SEARCH_SPARSE,
     _check_dim_from_cols,
     _check_sparse_dim_from_cols,
     _dense_col_ddl,
+    _dense_vec_str,
     _sparse_col_ddl,
     _to_sparsevec_string,
 )
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.exceptions import DatabaseError
-from chatbot_plugin_sdk.models.article import Article
-from chatbot_plugin_sdk.models.chunk import ArticleChunk
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +84,8 @@ class SyncPgBackend:
         self._engine = create_engine(url, pool_size=5, max_overflow=10, future=True)
         self._Session = sessionmaker(self._engine)
         self.schema = config.schema
+        self.articles_table = config.articles_table
+        self.chunks_table = config.chunks_table
         self._sparse_dim: int | None = None
 
     # ── Async wrappers (schedule sync work onto the event loop's thread pool) ──
@@ -121,51 +128,53 @@ class SyncPgBackend:
     # ── Sync implementations ────────────────────────────────────────────────
 
     def _setup_sync(self, dense_dim: int | None, sparse_dim: int | None) -> None:
-        """Create schema + tables if missing; validate dimensions if table already existed."""
         schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
         with self._engine.begin() as conn:
             conn.execute(text(_DDL_CREATE_EXTENSION))
             conn.execute(text(_DDL_CREATE_SCHEMA.format(schema=schema)))
-            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
+            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema, "t": ct})
             table_existed = r.fetchone() is not None
             if not table_existed:
                 dense_col = _dense_col_ddl(dense_dim)
                 sparse_col = _sparse_col_ddl(sparse_dim)
-                conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema)))
+                conn.execute(text(_DDL_CREATE_ARTICLES.format(schema=schema, articles_table=at)))
                 conn.execute(text(_DDL_CREATE_CHUNKS.format(
-                    schema=schema, dense_col=dense_col, sparse_col=sparse_col,
+                    schema=schema, articles_table=at, chunks_table=ct,
+                    dense_col=dense_col, sparse_col=sparse_col,
                 )))
-                conn.execute(text(_DDL_IDX_URL.format(schema=schema)))
-                conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema)))
+                conn.execute(text(_DDL_IDX_URL.format(schema=schema, articles_table=at)))
+                conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema, articles_table=at)))
                 logger.info(
                     "vector_tables_created",
-                    extra={"schema": schema, "dense_dim": dense_dim, "sparse_dim": sparse_dim},
+                    extra={"schema": schema, "articles_table": at, "chunks_table": ct,
+                           "dense_dim": dense_dim, "sparse_dim": sparse_dim},
                 )
             else:
-                logger.debug("vector_tables_exist", extra={"schema": schema})
+                logger.debug("vector_tables_exist", extra={"schema": schema, "chunks_table": ct})
 
-        # Validate dimensions outside the DDL transaction (separate connection)
         if table_existed and (dense_dim is not None or sparse_dim is not None):
             self._check_dim(dense_dim, sparse_dim)
 
     def _validate_sync(self, dense_dim: int | None, sparse_dim: int | None) -> None:
         schema = self.schema
+        ct = self.chunks_table
         with self._engine.connect() as conn:
-            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema})
+            r = conn.execute(text(_DDL_TABLE_EXISTS), {"s": schema, "t": ct})
             if r.fetchone() is None:
                 raise DatabaseError(
-                    f"Table {schema}.article_chunks not found. "
+                    f"Table {schema}.{ct} not found. "
                     "Run IngestProcessor first to create the schema."
                 )
         if dense_dim is not None or sparse_dim is not None:
             self._check_dim(dense_dim, sparse_dim)
 
     def _check_dim(self, dense_dim: int | None, sparse_dim: int | None) -> None:
-        """Validate that the existing column dimensions match the configured providers."""
         try:
-            cols = sa_inspect(self._engine).get_columns("article_chunks", schema=self.schema)
+            cols = sa_inspect(self._engine).get_columns(self.chunks_table, schema=self.schema)
         except Exception:
-            return  # table may not exist yet (race condition at startup — harmless)
+            return
         if dense_dim is not None:
             _check_dim_from_cols(cols, dense_dim)
         if sparse_dim is not None:
@@ -179,70 +188,56 @@ class SyncPgBackend:
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
     ) -> None:
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
         try:
-            with self._Session() as session:
-                with session.begin():
-                    existing = session.execute(
-                        select(Article).where(Article.id == article_id)
-                    ).scalar_one_or_none()
-
-                    if existing is not None:
-                        existing.url = metadata.get("url", "")
-                        existing.title = metadata.get("title")
-                        existing.source = metadata.get("source")
-                        existing.metadata_ = metadata.get("metadata")
-                        session.execute(
-                            delete(ArticleChunk).where(ArticleChunk.article_id == article_id)
-                        )
-                    else:
-                        session.add(Article(
-                            id=article_id,
-                            url=metadata.get("url", ""),
-                            title=metadata.get("title"),
-                            source=metadata.get("source"),
-                            metadata_=metadata.get("metadata"),
-                        ))
-
-                    for i, content in enumerate(chunks):
-                        sparse_val = None
-                        if sparse_vectors is not None and self._sparse_dim:
-                            sparse_val = _to_sparsevec_string(sparse_vectors[i], self._sparse_dim)
-                        session.add(ArticleChunk(
-                            article_id=article_id,
-                            chunk_index=i,
-                            content=content,
-                            dense_vector=dense_vectors[i] if dense_vectors else None,
-                            sparse_vector=sparse_val,
-                        ))
-                    # session.begin() auto-commits on clean exit, rolls back on exception
+            with self._engine.begin() as conn:
+                conn.execute(
+                    text(_DML_UPSERT_ARTICLE.format(schema=schema, articles_table=at)),
+                    {
+                        "id": str(article_id),
+                        "url": metadata.get("url", ""),
+                        "title": metadata.get("title"),
+                        "source": metadata.get("source"),
+                        "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
+                    },
+                )
+                conn.execute(
+                    text(_DML_DELETE_CHUNKS.format(schema=schema, chunks_table=ct)),
+                    {"article_id": str(article_id)},
+                )
+                for i, content in enumerate(chunks):
+                    dense_val = _dense_vec_str(dense_vectors[i]) if dense_vectors else None
+                    sparse_val = (
+                        _to_sparsevec_string(sparse_vectors[i], self._sparse_dim)
+                        if sparse_vectors is not None and self._sparse_dim
+                        else None
+                    )
+                    conn.execute(
+                        text(_DML_INSERT_CHUNK.format(schema=schema, chunks_table=ct)),
+                        {
+                            "article_id": str(article_id),
+                            "chunk_index": i,
+                            "content": content,
+                            "dense_vector": dense_val,
+                            "sparse_vector": sparse_val,
+                        },
+                    )
         except DatabaseError:
             raise
         except Exception as exc:
             raise DatabaseError(f"Upsert failed for article {article_id}: {exc}") from exc
 
-    def _search_sparse_sync(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
-        """Inner-product search on the SPARSEVEC column using the <#> operator."""
-        if not self._sparse_dim:
-            return []
-        sv_str = _to_sparsevec_string(query_vec, self._sparse_dim)
-        with self._Session() as db:
-            stmt = (
-                select(
-                    ArticleChunk.id.label("chunk_id"),
-                    ArticleChunk.article_id,
-                    ArticleChunk.chunk_index,
-                    ArticleChunk.content,
-                    Article.title,
-                    Article.url,
-                    ArticleChunk.sparse_vector.max_inner_product(sv_str).label("distance"),
-                )
-                .join(Article, ArticleChunk.article_id == Article.id)
-                .where(ArticleChunk.sparse_vector.isnot(None))
-                .order_by("distance")  # <#> returns negative inner product; ASC = most similar first
-                .limit(top_k)
-            )
-            rows = db.execute(stmt).all()
-
+    def _search_dense_sync(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(_DQL_SEARCH_DENSE.format(schema=schema, articles_table=at, chunks_table=ct)),
+                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k},
+            ).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),
@@ -256,25 +251,18 @@ class SyncPgBackend:
             for r in rows
         ]
 
-    def _search_dense_sync(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
-        with self._Session() as db:
-            stmt = (
-                select(
-                    ArticleChunk.id.label("chunk_id"),
-                    ArticleChunk.article_id,
-                    ArticleChunk.chunk_index,
-                    ArticleChunk.content,
-                    Article.title,
-                    Article.url,
-                    ArticleChunk.dense_vector.cosine_distance(query_vec).label("distance"),
-                )
-                .join(Article, ArticleChunk.article_id == Article.id)
-                .where(ArticleChunk.dense_vector.isnot(None))
-                .order_by("distance")
-                .limit(top_k)
-            )
-            rows = db.execute(stmt).all()
-
+    def _search_sparse_sync(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
+        if not self._sparse_dim:
+            return []
+        schema = self.schema
+        at = self.articles_table
+        ct = self.chunks_table
+        sv_str = _to_sparsevec_string(query_vec, self._sparse_dim)
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(_DQL_SEARCH_SPARSE.format(schema=schema, articles_table=at, chunks_table=ct)),
+                {"query_vec": sv_str, "top_k": top_k},
+            ).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),

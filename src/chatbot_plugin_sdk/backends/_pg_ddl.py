@@ -10,15 +10,8 @@ Why raw SQL (text()) instead of SQLAlchemy DDL API or MetaData.create_all()?
      model is defined without a fixed dimension, so the column type is only
      concrete at setup time.
 
-DML (upsert) uses the SQLAlchemy ORM (session.add / select) because ORM
-handles object identity, auto-flush, and transaction rollback cleanly.
-
-search_dense uses SQLAlchemy Core expressions so that cosine_distance() —
-registered on the Vector column by the pgvector SQLAlchemy integration —
-can be called as a column method rather than embedded in raw SQL.
-
-Dimension introspection uses SQLAlchemy reflect (sa_inspect) because the ORM
-model does not record the exact VECTOR dimension at runtime.
+All DML and DQL also use raw SQL so that table names remain fully configurable
+at runtime without needing dynamic ORM model classes.
 """
 from __future__ import annotations
 
@@ -26,12 +19,15 @@ from chatbot_plugin_sdk.exceptions import DatabaseError
 
 _DDL_CREATE_EXTENSION = "CREATE EXTENSION IF NOT EXISTS vector"
 _DDL_CREATE_SCHEMA    = "CREATE SCHEMA IF NOT EXISTS {schema}"
-_DDL_TABLE_EXISTS     = (
+
+# :s = schema, :t = chunks_table
+_DDL_TABLE_EXISTS = (
     "SELECT 1 FROM information_schema.tables "
-    "WHERE table_schema = :s AND table_name = 'article_chunks'"
+    "WHERE table_schema = :s AND table_name = :t"
 )
+
 _DDL_CREATE_ARTICLES = """\
-CREATE TABLE IF NOT EXISTS {schema}.articles (
+CREATE TABLE IF NOT EXISTS {schema}.{articles_table} (
     id         UUID PRIMARY KEY,
     url        TEXT NOT NULL UNIQUE,
     title      TEXT,
@@ -40,33 +36,83 @@ CREATE TABLE IF NOT EXISTS {schema}.articles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )"""
+
 _DDL_CREATE_CHUNKS = """\
-CREATE TABLE IF NOT EXISTS {schema}.article_chunks (
+CREATE TABLE IF NOT EXISTS {schema}.{chunks_table} (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     article_id    UUID NOT NULL
-                  REFERENCES {schema}.articles(id) ON DELETE CASCADE,
+                  REFERENCES {schema}.{articles_table}(id) ON DELETE CASCADE,
     chunk_index   INTEGER NOT NULL,
     content       TEXT NOT NULL,
     {dense_col},
     {sparse_col},
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT uq_article_chunk_idx UNIQUE (article_id, chunk_index)
+    CONSTRAINT uq_{chunks_table}_article_chunk_idx UNIQUE (article_id, chunk_index)
 )"""
-_DDL_IDX_URL    = "CREATE INDEX IF NOT EXISTS idx_articles_url    ON {schema}.articles(url)"
-_DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_articles_source ON {schema}.articles(source)"
+
+_DDL_IDX_URL    = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_url    ON {schema}.{articles_table}(url)"
+_DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_source ON {schema}.{articles_table}(source)"
+
+# ── DML (upsert) ────────────────────────────────────────────────────────────
+
+_DML_UPSERT_ARTICLE = """\
+INSERT INTO {schema}.{articles_table} (id, url, title, source, metadata)
+VALUES (:id, :url, :title, :source, CAST(:metadata AS JSONB))
+ON CONFLICT (id) DO UPDATE SET
+    url        = EXCLUDED.url,
+    title      = EXCLUDED.title,
+    source     = EXCLUDED.source,
+    metadata   = EXCLUDED.metadata,
+    updated_at = now()"""
+
+_DML_DELETE_CHUNKS = "DELETE FROM {schema}.{chunks_table} WHERE article_id = :article_id"
+
+_DML_INSERT_CHUNK = """\
+INSERT INTO {schema}.{chunks_table}
+    (article_id, chunk_index, content, dense_vector, sparse_vector)
+VALUES
+    (:article_id, :chunk_index, :content,
+     CAST(:dense_vector AS vector),
+     CAST(:sparse_vector AS sparsevec))"""
+
+# ── DQL (search) ────────────────────────────────────────────────────────────
+
+_DQL_SEARCH_DENSE = """\
+SELECT
+    ac.id          AS chunk_id,
+    ac.article_id,
+    ac.chunk_index,
+    ac.content,
+    a.title,
+    a.url,
+    ac.dense_vector <=> CAST(:query_vec AS vector) AS distance
+FROM {schema}.{chunks_table} ac
+JOIN {schema}.{articles_table} a ON ac.article_id = a.id
+WHERE ac.dense_vector IS NOT NULL
+ORDER BY distance
+LIMIT :top_k"""
+
+_DQL_SEARCH_SPARSE = """\
+SELECT
+    ac.id          AS chunk_id,
+    ac.article_id,
+    ac.chunk_index,
+    ac.content,
+    a.title,
+    a.url,
+    (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance
+FROM {schema}.{chunks_table} ac
+JOIN {schema}.{articles_table} a ON ac.article_id = a.id
+WHERE ac.sparse_vector IS NOT NULL
+ORDER BY distance
+LIMIT :top_k"""
 
 
 def _dense_col_ddl(dense_dim: int | None) -> str:
-    """Return the DDL fragment for the dense_vector column."""
     return f"dense_vector VECTOR({dense_dim})" if dense_dim else "dense_vector VECTOR(768)"
 
 
 def _sparse_col_ddl(sparse_dim: int | None) -> str:
-    """Return the DDL fragment for the sparse_vector column.
-
-    Uses SPARSEVEC({dim}) when a sparse provider dimension is configured (pgvector >= 0.7.0).
-    Falls back to JSONB when no sparse provider is active so the column is always present.
-    """
     if sparse_dim:
         return f"sparse_vector SPARSEVEC({sparse_dim})"
     return "sparse_vector JSONB"
@@ -86,13 +132,12 @@ def _to_sparsevec_string(d: dict[str, float], dim: int) -> str:
     return f"{{{items}}}/{dim}"
 
 
-def _check_dim_from_cols(cols: list[dict], dense_dim: int) -> None:
-    """Raise DatabaseError if the stored VECTOR dimension doesn't match dense_dim.
+def _dense_vec_str(vec: list[float]) -> str:
+    """Convert a Python float list to the PostgreSQL vector wire format: '[0.1,0.2,...]'."""
+    return "[" + ",".join(str(x) for x in vec) + "]"
 
-    Args:
-        cols: Column dicts from ``sqlalchemy.inspect(...).get_columns()``.
-        dense_dim: Expected dimension from the embedding provider.
-    """
+
+def _check_dim_from_cols(cols: list[dict], dense_dim: int) -> None:
     for col in cols:
         if col["name"] == "dense_vector":
             db_dim = getattr(col["type"], "dim", None)
@@ -106,12 +151,6 @@ def _check_dim_from_cols(cols: list[dict], dense_dim: int) -> None:
 
 
 def _check_sparse_dim_from_cols(cols: list[dict], sparse_dim: int) -> None:
-    """Raise DatabaseError if the stored SPARSEVEC dimension doesn't match sparse_dim.
-
-    Args:
-        cols: Column dicts from ``sqlalchemy.inspect(...).get_columns()``.
-        sparse_dim: Expected vocabulary size from the sparse embedding provider.
-    """
     for col in cols:
         if col["name"] == "sparse_vector":
             db_dim = getattr(col["type"], "dim", None)
