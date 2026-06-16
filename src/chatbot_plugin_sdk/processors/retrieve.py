@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+
 from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
 from chatbot_plugin_sdk.exceptions import NotConfiguredError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
 from chatbot_plugin_sdk.rerankers.base import Reranker
+
+logger = logging.getLogger(__name__)
 
 
 def _rrf_merge(
@@ -101,8 +105,10 @@ class RetrieveProcessor:
             raise NotConfiguredError("尚未呼叫 configure()。")
         dense_dim = self._dense.dimension if self._dense else None
         sparse_dim = self._sparse.dimension if self._sparse else None
+        logger.debug("retrieve_validate", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
         await self._backend.validate(dense_dim, sparse_dim)
         self._ready = True
+        logger.info("retrieve_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
     async def retrieve(self, query: str, top_k: int = 10) -> SearchResponse:
         """Retrieve the top-k chunks most semantically similar to the query.
@@ -116,6 +122,12 @@ class RetrieveProcessor:
         await self._ensure_ready()
 
         candidate_k = top_k * 3 if self._reranker is not None else top_k
+        logger.debug(
+            "retrieve_start",
+            extra={"query_len": len(query), "top_k": top_k, "candidate_k": candidate_k,
+                   "mode": "hybrid" if (self._dense and self._sparse) else "dense" if self._dense else "sparse",
+                   "reranker": type(self._reranker).__name__ if self._reranker else None},
+        )
 
         # ── Retrieval ─────────────────────────────────────────────────────────
         if self._dense is not None and self._sparse is not None:
@@ -144,7 +156,7 @@ class RetrieveProcessor:
         # ── Re-rank ───────────────────────────────────────────────────────────
         if self._reranker is not None:
             reranked = await self._reranker.rerank(query, ranked_rows)
-            return SearchResponse(chunks=[
+            result = SearchResponse(chunks=[
                 ChunkResult(
                     chunk_id=r.chunk_id,
                     article_id=r.article_id,
@@ -156,10 +168,12 @@ class RetrieveProcessor:
                 )
                 for r, s in reranked[:top_k]
             ])
+            logger.info("retrieve_complete", extra={"chunk_count": len(result.chunks), "reranked": True})
+            return result
 
         # ── Score ─────────────────────────────────────────────────────────────
         if rrf_scores:
-            return SearchResponse(chunks=[
+            result = SearchResponse(chunks=[
                 ChunkResult(
                     chunk_id=r.chunk_id,
                     article_id=r.article_id,
@@ -171,9 +185,11 @@ class RetrieveProcessor:
                 )
                 for r in ranked_rows[:top_k]
             ])
+            logger.info("retrieve_complete", extra={"chunk_count": len(result.chunks), "mode": "hybrid_rrf"})
+            return result
 
         # Dense-only or sparse-only: 1 − distance (cosine) or −distance (inner product)
-        return SearchResponse(chunks=[
+        result = SearchResponse(chunks=[
             ChunkResult(
                 chunk_id=r.chunk_id,
                 article_id=r.article_id,
@@ -185,6 +201,8 @@ class RetrieveProcessor:
             )
             for r in ranked_rows[:top_k]
         ])
+        logger.info("retrieve_complete", extra={"chunk_count": len(result.chunks), "mode": "single"})
+        return result
 
 
 async def _gather(coro_a, coro_b):
