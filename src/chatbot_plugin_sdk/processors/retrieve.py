@@ -110,7 +110,7 @@ class RetrieveProcessor:
         self._ready = True
         logger.info("retrieve_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
-    async def retrieve(self, query: str, top_k: int = 10) -> SearchResponse:
+    async def retrieve(self, query: str, top_k: int = 10, min_score: float = 0.0, min_rerank_score: float = 0.0) -> SearchResponse:
         """Retrieve the top-k chunks most semantically similar to the query.
 
         Hybrid mode (dense + sparse): fetches ``top_k * 3`` candidates from each source,
@@ -142,20 +142,28 @@ class RetrieveProcessor:
             merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
             ranked_rows = [r for r, _ in merged]
             rrf_scores = {r.chunk_id: s for r, s in merged}
+            if min_score > 0:
+                ranked_rows = [r for r in ranked_rows if rrf_scores.get(r.chunk_id, 0) >= min_score]
 
         elif self._dense is not None:
             dense_vecs = await self._dense.embed([query])
             ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k)
             rrf_scores = {}
+            if min_score > 0:
+                ranked_rows = [r for r in ranked_rows if (1.0 - r.distance) >= min_score]
 
         else:
             sparse_vecs = await self._sparse.embed([query])  # type: ignore[union-attr]
             ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k)
             rrf_scores = {}
+            if min_score > 0:
+                ranked_rows = [r for r in ranked_rows if (-r.distance) >= min_score]
 
         # ── Re-rank ───────────────────────────────────────────────────────────
         if self._reranker is not None:
             reranked = await self._reranker.rerank(query, ranked_rows)
+            if min_rerank_score > 0:
+                reranked = [(r, s) for r, s in reranked if s >= min_rerank_score]
             result = SearchResponse(chunks=[
                 ChunkResult(
                     chunk_id=r.chunk_id,

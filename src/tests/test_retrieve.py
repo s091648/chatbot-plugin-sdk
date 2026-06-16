@@ -282,3 +282,78 @@ class TestHybridRetrieve:
 
         _, called_k = backend.search_dense.call_args.args
         assert called_k == 15  # top_k * 3
+
+
+# ── min_score / min_rerank_score gating ──────────────────────────────────────────
+
+class TestRetrieveScoreGating:
+    @pytest.mark.asyncio
+    async def test_min_score_filters_dense_results(self):
+        """Chunks with score < min_score are removed before reranking."""
+        retriever, backend = _configured_retriever()
+        backend.search_dense.return_value = [
+            _make_row("c1", "a1", 0, "relevant", "T", "u", 0.1),  # score = 0.9
+            _make_row("c2", "a2", 0, "irrelevant", "T", "u", 0.8),  # score = 0.2
+        ]
+        with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", min_score=0.5)
+        assert len(result.chunks) == 1
+        assert result.chunks[0].chunk_id == "c1"
+
+    @pytest.mark.asyncio
+    async def test_min_score_zero_passes_everything(self):
+        retriever, backend = _configured_retriever()
+        backend.search_dense.return_value = [
+            _make_row("c1", "a1", 0, "text", "T", "u", 0.99),
+        ]
+        with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", min_score=0.0)
+        assert len(result.chunks) == 1
+
+    @pytest.mark.asyncio
+    async def test_min_rerank_score_filters_after_rerank(self):
+        backend = _mock_backend()
+        row1 = _make_row("c1", "a1", 0, "relevant", "T", "u", 0.1)
+        row2 = _make_row("c2", "a2", 0, "irrelevant", "T", "u", 0.3)
+        backend.search_dense.return_value = [row1, row2]
+        dense = EndpointProvider(url="http://x", dimension=768)
+        reranker = MagicMock()
+        reranker.rerank = AsyncMock(return_value=[(row1, 0.9), (row2, 0.4)])
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, reranker=reranker)
+        retriever._ready = True
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", top_k=5, min_rerank_score=0.7)
+        assert len(result.chunks) == 1
+        assert result.chunks[0].chunk_id == "c1"
+        assert result.chunks[0].score == pytest.approx(0.9)
+
+    @pytest.mark.asyncio
+    async def test_min_rerank_score_zero_passes_everything(self):
+        backend = _mock_backend()
+        row1 = _make_row("c1", "a1", 0, "text", "T", "u", 0.1)
+        backend.search_dense.return_value = [row1]
+        dense = EndpointProvider(url="http://x", dimension=768)
+        reranker = MagicMock()
+        reranker.rerank = AsyncMock(return_value=[(row1, 0.15)])
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, reranker=reranker)
+        retriever._ready = True
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", min_rerank_score=0.0)
+        assert len(result.chunks) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_chunks_filtered_returns_empty(self):
+        retriever, backend = _configured_retriever()
+        backend.search_dense.return_value = [
+            _make_row("c1", "a1", 0, "text", "T", "u", 0.95),
+        ]
+        with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            result = await retriever.retrieve("q", min_score=0.5)
+        assert result.chunks == []
