@@ -38,6 +38,9 @@ from chatbot_plugin_sdk.backends.sync_pg import SyncPgBackend
 from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
 from chatbot_plugin_sdk.providers.endpoint import EndpointProvider
 from chatbot_plugin_sdk.providers.local import LocalProvider
+from chatbot_plugin_sdk.providers.fastembed import FastEmbedDenseProvider, FastEmbedSparseProvider
+from chatbot_plugin_sdk.providers.gemini import GeminiDenseProvider
+from chatbot_plugin_sdk.providers import build_dense_provider, build_sparse_provider
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.contracts.responses import SearchResponse, ChunkResult
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
@@ -67,6 +70,11 @@ __all__ = [
     # Providers
     "EndpointProvider",
     "LocalProvider",
+    "FastEmbedDenseProvider",
+    "FastEmbedSparseProvider",
+    "GeminiDenseProvider",
+    "build_dense_provider",
+    "build_sparse_provider",
     # Config
     "DatabaseConfig",
     # Responses

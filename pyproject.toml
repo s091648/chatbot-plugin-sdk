@@ -14,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 fastembed = ["fastembed>=0.3"]
 sync = ["psycopg2-binary>=2.9"]
+gemini = ["google-genai>=1.0"]
 
 [dependency-groups]
 dev = [
