@@ -28,6 +28,7 @@ import uuid
 
 from sqlalchemy import create_engine, inspect as sa_inspect, text
 from sqlalchemy.orm import sessionmaker
+import pgvector.sqlalchemy  # noqa: F401 — registers vector/sparsevec types with SQLAlchemy
 
 import logging
 

@@ -17,6 +17,7 @@ import uuid
 
 from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+import pgvector.sqlalchemy  # noqa: F401 — registers vector/sparsevec types with SQLAlchemy
 
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
