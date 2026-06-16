@@ -28,13 +28,14 @@ _DDL_TABLE_EXISTS = (
 
 _DDL_CREATE_ARTICLES = """\
 CREATE TABLE IF NOT EXISTS {schema}.{articles_table} (
-    id         UUID PRIMARY KEY,
-    url        TEXT NOT NULL UNIQUE,
-    title      TEXT,
-    source     TEXT,
-    metadata   JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                UUID PRIMARY KEY,
+    url               TEXT NOT NULL UNIQUE,
+    title             TEXT,
+    source            TEXT,
+    public_article_id UUID,
+    metadata          JSONB,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 )"""
 
 _DDL_CREATE_CHUNKS = """\
@@ -56,14 +57,15 @@ _DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_source ON {sc
 # ── DML (upsert) ────────────────────────────────────────────────────────────
 
 _DML_UPSERT_ARTICLE = """\
-INSERT INTO {schema}.{articles_table} (id, url, title, source, metadata)
-VALUES (:id, :url, :title, :source, CAST(:metadata AS JSONB))
+INSERT INTO {schema}.{articles_table} (id, url, title, source, public_article_id, metadata)
+VALUES (:id, :url, :title, :source, CAST(:public_article_id AS UUID), CAST(:metadata AS JSONB))
 ON CONFLICT (id) DO UPDATE SET
-    url        = EXCLUDED.url,
-    title      = EXCLUDED.title,
-    source     = EXCLUDED.source,
-    metadata   = EXCLUDED.metadata,
-    updated_at = now()"""
+    url               = EXCLUDED.url,
+    title             = EXCLUDED.title,
+    source            = EXCLUDED.source,
+    public_article_id = EXCLUDED.public_article_id,
+    metadata          = EXCLUDED.metadata,
+    updated_at        = now()"""
 
 _DML_DELETE_CHUNKS = "DELETE FROM {schema}.{chunks_table} WHERE article_id = :article_id"
 
@@ -79,12 +81,13 @@ VALUES
 
 _DQL_SEARCH_DENSE = """\
 SELECT
-    ac.id          AS chunk_id,
+    ac.id                    AS chunk_id,
     ac.article_id,
     ac.chunk_index,
     ac.content,
     a.title,
     a.url,
+    a.public_article_id,
     ac.dense_vector <=> CAST(:query_vec AS vector) AS distance
 FROM {schema}.{chunks_table} ac
 JOIN {schema}.{articles_table} a ON ac.article_id = a.id
@@ -94,12 +97,13 @@ LIMIT :top_k"""
 
 _DQL_SEARCH_SPARSE = """\
 SELECT
-    ac.id          AS chunk_id,
+    ac.id                    AS chunk_id,
     ac.article_id,
     ac.chunk_index,
     ac.content,
     a.title,
     a.url,
+    a.public_article_id,
     (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance
 FROM {schema}.{chunks_table} ac
 JOIN {schema}.{articles_table} a ON ac.article_id = a.id

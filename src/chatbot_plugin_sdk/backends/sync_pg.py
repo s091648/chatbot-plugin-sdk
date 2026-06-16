@@ -201,6 +201,7 @@ class SyncPgBackend:
                         "url": metadata.get("url", ""),
                         "title": metadata.get("title"),
                         "source": metadata.get("source"),
+                        "public_article_id": metadata.get("public_article_id"),
                         "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
                     },
                 )
@@ -248,6 +249,7 @@ class SyncPgBackend:
                 title=r.title,
                 url=r.url,
                 distance=float(r.distance),
+                public_article_id=str(r.public_article_id) if r.public_article_id else None,
             )
             for r in rows
         ]
@@ -273,6 +275,7 @@ class SyncPgBackend:
                 title=r.title,
                 url=r.url,
                 distance=float(r.distance),
+                public_article_id=str(r.public_article_id) if r.public_article_id else None,
             )
             for r in rows
         ]

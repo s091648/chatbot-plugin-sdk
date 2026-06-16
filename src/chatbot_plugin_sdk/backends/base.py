@@ -16,6 +16,7 @@ class SearchRow:
     title: str | None
     url: str | None
     distance: float   # raw cosine distance (0 = identical, 2 = opposite)
+    public_article_id: str | None = None  # UUID of the record in the source application DB
 
 
 @runtime_checkable

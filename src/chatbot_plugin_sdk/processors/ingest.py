@@ -96,7 +96,9 @@ class IngestProcessor:
         Args:
             full_text: Raw article text (HTML-stripped or plain).
             metadata:  Must contain ``url`` (str) for idempotent upsert keying.
-                       Also accepts ``title`` and ``source``.
+                       Also accepts ``title``, ``source``, and ``public_article_id``
+                       (UUID string of the corresponding record in the source
+                       database, used for cross-schema joins).
         """
         await self._ensure_ready()
 

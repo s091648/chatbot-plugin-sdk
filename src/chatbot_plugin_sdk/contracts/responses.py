@@ -11,6 +11,7 @@ class ChunkResult(BaseModel):
     article_id: str
     article_title: str | None = None
     article_url: str | None = None
+    public_article_id: str | None = None
     chunk_index: int
     content: str
     score: float = Field(..., description="Cosine similarity score (0-1, higher is better)")
