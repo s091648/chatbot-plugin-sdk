@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Any
 
 from sqlalchemy import inspect as sa_inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -21,6 +22,9 @@ import pgvector.sqlalchemy  # noqa: F401 — registers vector/sparsevec types wi
 
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
+    _build_search_dense_sql,
+    _build_search_sparse_sql,
+    _build_upsert_article_sql,
     _DDL_CREATE_CHUNKS,
     _DDL_CREATE_ARTICLES,
     _DDL_CREATE_EXTENSION,
@@ -30,9 +34,7 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_TABLE_EXISTS,
     _DML_DELETE_CHUNKS,
     _DML_INSERT_CHUNK,
-    _DML_UPSERT_ARTICLE,
-    _DQL_SEARCH_DENSE,
-    _DQL_SEARCH_SPARSE,
+    _split_article_fields,
     _check_dim_from_cols,
     _check_sparse_dim_from_cols,
     _dense_col_ddl,
@@ -92,24 +94,20 @@ class AsyncPgBackend:
         chunks: list[str],
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
+        article_columns: dict[str, Any] | None = None,
     ) -> None:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
+        col_params, jsonb_metadata = _split_article_fields(metadata, article_columns)
         try:
             async with self._engine.begin() as conn:
-                await conn.execute(
-                    text(_DML_UPSERT_ARTICLE.format(schema=schema, articles_table=at)),
-                    {
-                        "id": str(article_id),
-                        "url": metadata.get("url", ""),
-                        "title": metadata.get("title"),
-                        "source": metadata.get("source"),
-                        "public_article_id": metadata.get("public_article_id"),
-                        "topic_id": metadata.get("topic_id"),
-                        "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
-                    },
-                )
+                sql = _build_upsert_article_sql(schema, at, col_params)
+                params = {"id": str(article_id)}
+                params.update(col_params)
+                params["metadata"] = json.dumps(jsonb_metadata) if jsonb_metadata is not None else None
+                await conn.execute(text(sql), params)
+
                 await conn.execute(
                     text(_DML_DELETE_CHUNKS.format(schema=schema, chunks_table=ct)),
                     {"article_id": str(article_id)},
@@ -138,15 +136,20 @@ class AsyncPgBackend:
 
     # ── Read ───────────────────────────────────────────────────────────────
 
-    async def search_dense(self, query_vec: list[float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
+    async def search_dense(
+        self,
+        query_vec: list[float],
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[SearchRow]:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
+        sql, filter_params = _build_search_dense_sql(schema, at, ct, filters)
+        params = {"query_vec": _dense_vec_str(query_vec), "top_k": top_k}
+        params.update(filter_params)
         async with self._engine.connect() as conn:
-            rows = (await conn.execute(
-                text(_DQL_SEARCH_DENSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k, "topic_id": topic_id},
-            )).all()
+            rows = (await conn.execute(text(sql), params)).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),
@@ -157,23 +160,27 @@ class AsyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
-                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]
 
-    async def search_sparse(self, query_vec: dict[str, float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
+    async def search_sparse(
+        self,
+        query_vec: dict[str, float],
+        top_k: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[SearchRow]:
         if not self._sparse_dim:
             return []
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
+        sql, filter_params = _build_search_sparse_sql(schema, at, ct, filters)
         sv_str = _to_sparsevec_string(query_vec, self._sparse_dim)
+        params = {"query_vec": sv_str, "top_k": top_k}
+        params.update(filter_params)
         async with self._engine.connect() as conn:
-            rows = (await conn.execute(
-                text(_DQL_SEARCH_SPARSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": sv_str, "top_k": top_k, "topic_id": topic_id},
-            )).all()
+            rows = (await conn.execute(text(sql), params)).all()
         return [
             SearchRow(
                 chunk_id=str(r.chunk_id),
@@ -184,7 +191,6 @@ class AsyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
-                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]
