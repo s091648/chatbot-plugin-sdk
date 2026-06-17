@@ -34,9 +34,8 @@ class IngestProcessor:
         )
         await processor.ingest(
             full_text="...",
-            article_id="550e8400-e29b-41d4-a716-446655440000",
-            article_columns={
-                "url": "https://example.com/article",
+            articles_column_values={
+                "url": "https://example.com/article",  # required — used as idempotent key
                 "title": "My Article",
             },
         )
@@ -93,27 +92,31 @@ class IngestProcessor:
     async def ingest(
         self,
         full_text: str,
-        article_id: str | uuid.UUID,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Full ingest pipeline: normalize → chunk → embed → upsert.
 
         Args:
             full_text: Raw article text (HTML-stripped or plain).
-            article_id: Unique identifier for this article (UUID or UUID string).
-                        Used as the primary key for idempotent upserts.
-            article_columns: SQL column values for the articles table (e.g.
-                              ``{"url": "...", "title": "...", "source": "..."}``).
-                              Keys must belong to the known article column set.
-                              This is the sole source of SQL column values; the
-                              ``metadata`` dict is never promoted to columns.
+            articles_column_values: SQL column values for the articles table.
+                                    Must include ``url`` — it is used to derive
+                                    a deterministic ``article_id`` via
+                                    ``uuid.uuid5(NAMESPACE_URL, url)`` for
+                                    idempotent upserts.  Any other keys become
+                                    INSERT columns; column existence is the
+                                    caller's responsibility.
             metadata: Opaque JSONB metadata — the SDK never interprets its keys.
         """
         await self._ensure_ready()
 
-        if isinstance(article_id, str):
-            article_id = uuid.UUID(article_id)
+        url = (articles_column_values or {}).get("url") or ""
+        if not url:
+            raise DatabaseError(
+                "'url' is required in articles_column_values — "
+                "it is used to derive the idempotent article_id via uuid5."
+            )
+        article_id = uuid.uuid5(uuid.NAMESPACE_URL, url)
 
         normalized = self._normalize(full_text)
         if not normalized:
@@ -142,11 +145,16 @@ class IngestProcessor:
                     f"but {len(chunks)} chunks expected."
                 )
 
-        logger.debug("ingest_upserting", extra={"article_id": str(article_id), "chunk_count": len(chunks)})
-        await self._backend.upsert(article_id, metadata or {}, chunks, dense_vectors, sparse_vectors,
-            article_columns=article_columns,
+        logger.debug("ingest_upserting", extra={"url": url, "chunk_count": len(chunks)})
+        await self._backend.upsert(
+            article_id,
+            metadata or {},
+            chunks,
+            dense_vectors,
+            sparse_vectors,
+            articles_column_values=articles_column_values,
         )
         logger.info(
             "ingest_complete",
-            extra={"article_id": str(article_id), "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
+            extra={"url": url, "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
         )

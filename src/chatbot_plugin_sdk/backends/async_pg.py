@@ -22,7 +22,6 @@ import pgvector.sqlalchemy  # noqa: F401 — registers vector/sparsevec types wi
 
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
-    _ARTICLE_COLUMNS,
     _build_search_dense_sql,
     _build_search_sparse_sql,
     _build_upsert_article_sql,
@@ -30,7 +29,6 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_CREATE_ARTICLES,
     _DDL_CREATE_EXTENSION,
     _DDL_CREATE_SCHEMA,
-    _DDL_IDX_SOURCE,
     _DDL_IDX_URL,
     _DDL_TABLE_EXISTS,
     _DML_DELETE_CHUNKS,
@@ -96,12 +94,12 @@ class AsyncPgBackend:
         chunks: list[str],
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
     ) -> None:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
-        col_params, jsonb_metadata = _prepare_upsert_params(metadata, article_columns)
+        col_params, jsonb_metadata = _prepare_upsert_params(metadata, articles_column_values)
         try:
             async with self._engine.begin() as conn:
                 sql = _build_upsert_article_sql(schema, at, col_params)
@@ -134,7 +132,7 @@ class AsyncPgBackend:
         except DatabaseError:
             raise
         except Exception as exc:
-            raise DatabaseError(f"Upsert failed for article {article_id}: {exc}") from exc
+            raise DatabaseError(f"Upsert failed for article_id={article_id}: {exc}") from exc
 
     # ── Read ───────────────────────────────────────────────────────────────
 
@@ -159,7 +157,7 @@ class AsyncPgBackend:
                 chunk_index=r.chunk_index,
                 content=r.content,
                 distance=float(r.distance),
-                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
+                article_metadata=_extract_article_metadata(r._mapping),
             )
             for r in rows
         ]
@@ -188,7 +186,7 @@ class AsyncPgBackend:
                 chunk_index=r.chunk_index,
                 content=r.content,
                 distance=float(r.distance),
-                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
+                article_metadata=_extract_article_metadata(r._mapping),
             )
             for r in rows
         ]
@@ -218,7 +216,6 @@ class AsyncPgBackend:
                     dense_col=dense_col, sparse_col=sparse_col,
                 )))
                 await conn.execute(text(_DDL_IDX_URL.format(schema=schema, articles_table=at)))
-                await conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema, articles_table=at)))
 
         if table_existed and (dense_dim is not None or sparse_dim is not None):
             await self._check_dim(dense_dim, sparse_dim)
