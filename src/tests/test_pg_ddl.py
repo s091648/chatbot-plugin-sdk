@@ -110,3 +110,19 @@ class TestBuildSearchDenseSql:
         )
         assert "a.source = :_f_source" in sql
         assert params["_f_source"] == "wiki"
+
+
+class TestBuildSearchSparseSql:
+    def test_no_filters(self):
+        sql, params = _build_search_sparse_sql("vectors", "articles", "chunks")
+        assert "WHERE ac.sparse_vector IS NOT NULL" in sql
+        assert "sparse_vector <#>" in sql
+        assert params == {}
+
+    def test_with_filters(self):
+        sql, params = _build_search_sparse_sql(
+            "vectors", "articles", "chunks",
+            filters={"topic_id": "uuid-xxx"},
+        )
+        assert "CAST(:_f_topic_id AS UUID)" in sql
+        assert params["_f_topic_id"] == "uuid-xxx"
