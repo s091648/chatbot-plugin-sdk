@@ -17,6 +17,7 @@ class SearchRow:
     url: str | None
     distance: float   # raw cosine distance (0 = identical, 2 = opposite)
     public_article_id: str | None = None  # UUID of the record in the source application DB
+    topic_id: str | None = None  # UUID of the topic this article belongs to
 
 
 @runtime_checkable
@@ -79,6 +80,7 @@ class DatabaseBackend(Protocol):
         self,
         query_vec: list[float],
         top_k: int,
+        topic_id: str | None = None,
     ) -> list[SearchRow]:
         """Cosine similarity search on the dense_vector column."""
         ...
@@ -87,6 +89,7 @@ class DatabaseBackend(Protocol):
         self,
         query_vec: dict[str, float],
         top_k: int,
+        topic_id: str | None = None,
     ) -> list[SearchRow]:
         """Maximum inner product search on the sparse_vector column (<#> operator).
 

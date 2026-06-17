@@ -115,13 +115,13 @@ class SyncPgBackend:
             article_id, metadata, chunks, dense_vectors, sparse_vectors,
         )
 
-    async def search_dense(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
+    async def search_dense(self, query_vec: list[float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._search_dense_sync, query_vec, top_k)
+        return await loop.run_in_executor(None, self._search_dense_sync, query_vec, top_k, topic_id)
 
-    async def search_sparse(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
+    async def search_sparse(self, query_vec: dict[str, float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._search_sparse_sync, query_vec, top_k)
+        return await loop.run_in_executor(None, self._search_sparse_sync, query_vec, top_k, topic_id)
 
     async def close(self) -> None:
         self._engine.dispose()
@@ -202,6 +202,7 @@ class SyncPgBackend:
                         "title": metadata.get("title"),
                         "source": metadata.get("source"),
                         "public_article_id": metadata.get("public_article_id"),
+                        "topic_id": metadata.get("topic_id"),
                         "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
                     },
                 )
@@ -231,14 +232,14 @@ class SyncPgBackend:
         except Exception as exc:
             raise DatabaseError(f"Upsert failed for article {article_id}: {exc}") from exc
 
-    def _search_dense_sync(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
+    def _search_dense_sync(self, query_vec: list[float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(_DQL_SEARCH_DENSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k},
+                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k, "topic_id": topic_id},
             ).all()
         return [
             SearchRow(
@@ -250,11 +251,12 @@ class SyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]
 
-    def _search_sparse_sync(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
+    def _search_sparse_sync(self, query_vec: dict[str, float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         if not self._sparse_dim:
             return []
         schema = self.schema
@@ -264,7 +266,7 @@ class SyncPgBackend:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(_DQL_SEARCH_SPARSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": sv_str, "top_k": top_k},
+                {"query_vec": sv_str, "top_k": top_k, "topic_id": topic_id},
             ).all()
         return [
             SearchRow(
@@ -276,6 +278,7 @@ class SyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]

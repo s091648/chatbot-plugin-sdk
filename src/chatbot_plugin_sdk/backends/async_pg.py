@@ -106,6 +106,7 @@ class AsyncPgBackend:
                         "title": metadata.get("title"),
                         "source": metadata.get("source"),
                         "public_article_id": metadata.get("public_article_id"),
+                        "topic_id": metadata.get("topic_id"),
                         "metadata": json.dumps(metadata.get("metadata")) if metadata.get("metadata") is not None else None,
                     },
                 )
@@ -137,14 +138,14 @@ class AsyncPgBackend:
 
     # ── Read ───────────────────────────────────────────────────────────────
 
-    async def search_dense(self, query_vec: list[float], top_k: int) -> list[SearchRow]:
+    async def search_dense(self, query_vec: list[float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
         async with self._engine.connect() as conn:
             rows = (await conn.execute(
                 text(_DQL_SEARCH_DENSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k},
+                {"query_vec": _dense_vec_str(query_vec), "top_k": top_k, "topic_id": topic_id},
             )).all()
         return [
             SearchRow(
@@ -156,11 +157,12 @@ class AsyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]
 
-    async def search_sparse(self, query_vec: dict[str, float], top_k: int) -> list[SearchRow]:
+    async def search_sparse(self, query_vec: dict[str, float], top_k: int, topic_id: str | None = None) -> list[SearchRow]:
         if not self._sparse_dim:
             return []
         schema = self.schema
@@ -170,7 +172,7 @@ class AsyncPgBackend:
         async with self._engine.connect() as conn:
             rows = (await conn.execute(
                 text(_DQL_SEARCH_SPARSE.format(schema=schema, articles_table=at, chunks_table=ct)),
-                {"query_vec": sv_str, "top_k": top_k},
+                {"query_vec": sv_str, "top_k": top_k, "topic_id": topic_id},
             )).all()
         return [
             SearchRow(
@@ -182,6 +184,7 @@ class AsyncPgBackend:
                 url=r.url,
                 distance=float(r.distance),
                 public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                topic_id=str(r.topic_id) if r.topic_id else None,
             )
             for r in rows
         ]

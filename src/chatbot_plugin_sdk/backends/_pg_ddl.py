@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{articles_table} (
     title             TEXT,
     source            TEXT,
     public_article_id UUID,
+    topic_id          UUID,
     metadata          JSONB,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -57,13 +58,14 @@ _DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_source ON {sc
 # ── DML (upsert) ────────────────────────────────────────────────────────────
 
 _DML_UPSERT_ARTICLE = """\
-INSERT INTO {schema}.{articles_table} (id, url, title, source, public_article_id, metadata)
-VALUES (:id, :url, :title, :source, CAST(:public_article_id AS UUID), CAST(:metadata AS JSONB))
+INSERT INTO {schema}.{articles_table} (id, url, title, source, public_article_id, topic_id, metadata)
+VALUES (:id, :url, :title, :source, CAST(:public_article_id AS UUID), CAST(:topic_id AS UUID), CAST(:metadata AS JSONB))
 ON CONFLICT (id) DO UPDATE SET
     url               = EXCLUDED.url,
     title             = EXCLUDED.title,
     source            = EXCLUDED.source,
     public_article_id = EXCLUDED.public_article_id,
+    topic_id          = EXCLUDED.topic_id,
     metadata          = EXCLUDED.metadata,
     updated_at        = now()"""
 
@@ -88,10 +90,12 @@ SELECT
     a.title,
     a.url,
     a.public_article_id,
+    a.topic_id,
     ac.dense_vector <=> CAST(:query_vec AS vector) AS distance
 FROM {schema}.{chunks_table} ac
 JOIN {schema}.{articles_table} a ON ac.article_id = a.id
 WHERE ac.dense_vector IS NOT NULL
+  AND (:topic_id IS NULL OR a.topic_id = CAST(:topic_id AS UUID))
 ORDER BY distance
 LIMIT :top_k"""
 
@@ -104,10 +108,12 @@ SELECT
     a.title,
     a.url,
     a.public_article_id,
+    a.topic_id,
     (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance
 FROM {schema}.{chunks_table} ac
 JOIN {schema}.{articles_table} a ON ac.article_id = a.id
 WHERE ac.sparse_vector IS NOT NULL
+  AND (:topic_id IS NULL OR a.topic_id = CAST(:topic_id AS UUID))
 ORDER BY distance
 LIMIT :top_k"""
 

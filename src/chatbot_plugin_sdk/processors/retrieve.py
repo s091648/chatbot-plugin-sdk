@@ -110,7 +110,7 @@ class RetrieveProcessor:
         self._ready = True
         logger.info("retrieve_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
-    async def retrieve(self, query: str, top_k: int = 10, min_score: float = 0.0, min_rerank_score: float = 0.0) -> SearchResponse:
+    async def retrieve(self, query: str, top_k: int = 10, min_score: float = 0.0, min_rerank_score: float = 0.0, topic_id: str | None = None) -> SearchResponse:
         """Retrieve the top-k chunks most semantically similar to the query.
 
         Hybrid mode (dense + sparse): fetches ``top_k * 3`` candidates from each source,
@@ -136,8 +136,8 @@ class RetrieveProcessor:
                 self._sparse.embed([query]),
             )
             dense_rows, sparse_rows = await _gather(
-                self._backend.search_dense(dense_vecs[0], candidate_k),
-                self._backend.search_sparse(sparse_vecs[0], candidate_k),
+                self._backend.search_dense(dense_vecs[0], candidate_k, topic_id=topic_id),
+                self._backend.search_sparse(sparse_vecs[0], candidate_k, topic_id=topic_id),
             )
             merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
             ranked_rows = [r for r, _ in merged]
@@ -147,14 +147,14 @@ class RetrieveProcessor:
 
         elif self._dense is not None:
             dense_vecs = await self._dense.embed([query])
-            ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k)
+            ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k, topic_id=topic_id)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (1.0 - r.distance) >= min_score]
 
         else:
             sparse_vecs = await self._sparse.embed([query])  # type: ignore[union-attr]
-            ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k)
+            ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k, topic_id=topic_id)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (-r.distance) >= min_score]
