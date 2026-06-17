@@ -1,5 +1,7 @@
 """Request contracts — mirrors specs/toolbox-api.md request bodies."""
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -42,6 +44,10 @@ class SearchRequest(BaseModel):
 
     query: str = Field(..., min_length=1, description="Raw query text")
     top_k: int = Field(default=10, ge=1, le=100, description="Number of top chunks to return")
+    filters: dict[str, Any] | None = Field(
+        default=None,
+        description="Column-level filters on the articles table, e.g. {\"topic_id\": \"uuid\"}",
+    )
 
 
 class ChatRequest(BaseModel):

@@ -21,6 +21,8 @@ class Article(Base):
     url = Column(String, nullable=False, unique=True)
     title = Column(String, nullable=True)
     source = Column(String, nullable=True)
+    public_article_id = Column(UUID(as_uuid=True), nullable=True)
+    topic_id = Column(UUID(as_uuid=True), nullable=True)
     metadata_ = Column("metadata", JSONB, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
