@@ -15,7 +15,154 @@ at runtime without needing dynamic ORM model classes.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from chatbot_plugin_sdk.exceptions import DatabaseError
+
+_ARTICLE_COLUMNS = frozenset({
+    "url", "title", "source", "public_article_id", "topic_id",
+})
+
+
+def _split_article_fields(
+    metadata: dict,
+    article_columns: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict | None]:
+    """Split article-level fields from metadata into SQL column params vs JSONB blob."""
+    col_params: dict[str, Any] = {}
+    for key in ("url", "title", "source", "public_article_id"):
+        if key in metadata:
+            col_params[key] = metadata[key]
+
+    if article_columns:
+        for key, value in article_columns.items():
+            if key not in _ARTICLE_COLUMNS:
+                raise DatabaseError(
+                    f"article_columns key {key!r} is not a known article column. "
+                    f"Known columns: {sorted(_ARTICLE_COLUMNS)}"
+                )
+            col_params[key] = value
+
+    jsonb_keys = set(metadata.keys()) - _ARTICLE_COLUMNS
+    jsonb_metadata = {k: metadata[k] for k in jsonb_keys if k in metadata} or None
+
+    return col_params, jsonb_metadata
+
+
+def _build_upsert_article_sql(
+    schema: str,
+    articles_table: str,
+    col_params: dict[str, Any],
+) -> str:
+    """Build parameterized INSERT ... ON CONFLICT UPDATE for the articles table."""
+    cols = sorted(col_params.keys())
+    insert_cols = ["id"] + cols + ["metadata"]
+    uuid_cols = {"id", "public_article_id", "topic_id"}
+    cast_placeholders = []
+    for c in insert_cols:
+        if c in uuid_cols:
+            cast_placeholders.append(f"CAST(:{c} AS UUID)")
+        elif c == "metadata":
+            cast_placeholders.append("CAST(:metadata AS JSONB)")
+        else:
+            cast_placeholders.append(f":{c}")
+
+    update_sets = ", ".join(
+        f"{c} = EXCLUDED.{c}" for c in cols if c != "url"
+    ) + ", metadata = EXCLUDED.metadata, updated_at = now()"
+
+    return (
+        f"INSERT INTO {schema}.{articles_table} ({', '.join(insert_cols)})\n"
+        f"VALUES ({', '.join(cast_placeholders)})\n"
+        f"ON CONFLICT (id) DO UPDATE SET\n    {update_sets}"
+    )
+
+
+def _build_search_where(
+    filters: dict[str, Any] | None,
+    table_alias: str = "a",
+) -> tuple[str, dict[str, Any]]:
+    """Build parameterized WHERE clause fragment from filters dict."""
+    if not filters:
+        return "", {}
+
+    uuid_cols = {"public_article_id", "topic_id"}
+    fragments = []
+    params: dict[str, Any] = {}
+
+    for col, value in filters.items():
+        if col not in _ARTICLE_COLUMNS:
+            raise DatabaseError(
+                f"filter key {col!r} is not a known article column. "
+                f"Known columns: {sorted(_ARTICLE_COLUMNS)}"
+            )
+        param_name = f"_f_{col}"
+        if col in uuid_cols:
+            fragments.append(
+                f"({table_alias}.{col} = CAST(:{param_name} AS UUID))"
+            )
+        else:
+            fragments.append(
+                f"({table_alias}.{col} = :{param_name})"
+            )
+        params[param_name] = value
+
+    where = " AND " + " AND ".join(fragments)
+    return where, params
+
+
+def _build_search_dense_sql(
+    schema: str,
+    articles_table: str,
+    chunks_table: str,
+    filters: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    where_frag, filter_params = _build_search_where(filters)
+    sql = (
+        f"SELECT\n"
+        f"    ac.id                    AS chunk_id,\n"
+        f"    ac.article_id,\n"
+        f"    ac.chunk_index,\n"
+        f"    ac.content,\n"
+        f"    a.title,\n"
+        f"    a.url,\n"
+        f"    a.public_article_id,\n"
+        f"    ac.dense_vector <=> CAST(:query_vec AS vector) AS distance\n"
+        f"FROM {schema}.{chunks_table} ac\n"
+        f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"
+        f"WHERE ac.dense_vector IS NOT NULL\n"
+        f"{where_frag}\n"
+        f"ORDER BY distance\n"
+        f"LIMIT :top_k"
+    )
+    return sql, filter_params
+
+
+def _build_search_sparse_sql(
+    schema: str,
+    articles_table: str,
+    chunks_table: str,
+    filters: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    where_frag, filter_params = _build_search_where(filters)
+    sql = (
+        f"SELECT\n"
+        f"    ac.id                    AS chunk_id,\n"
+        f"    ac.article_id,\n"
+        f"    ac.chunk_index,\n"
+        f"    ac.content,\n"
+        f"    a.title,\n"
+        f"    a.url,\n"
+        f"    a.public_article_id,\n"
+        f"    (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance\n"
+        f"FROM {schema}.{chunks_table} ac\n"
+        f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"
+        f"WHERE ac.sparse_vector IS NOT NULL\n"
+        f"{where_frag}\n"
+        f"ORDER BY distance\n"
+        f"LIMIT :top_k"
+    )
+    return sql, filter_params
 
 _DDL_CREATE_EXTENSION = "CREATE EXTENSION IF NOT EXISTS vector"
 _DDL_CREATE_SCHEMA    = "CREATE SCHEMA IF NOT EXISTS {schema}"
@@ -55,19 +202,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{chunks_table} (
 _DDL_IDX_URL    = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_url    ON {schema}.{articles_table}(url)"
 _DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_source ON {schema}.{articles_table}(source)"
 
-# ── DML (upsert) ────────────────────────────────────────────────────────────
-
-_DML_UPSERT_ARTICLE = """\
-INSERT INTO {schema}.{articles_table} (id, url, title, source, public_article_id, topic_id, metadata)
-VALUES (:id, :url, :title, :source, CAST(:public_article_id AS UUID), CAST(:topic_id AS UUID), CAST(:metadata AS JSONB))
-ON CONFLICT (id) DO UPDATE SET
-    url               = EXCLUDED.url,
-    title             = EXCLUDED.title,
-    source            = EXCLUDED.source,
-    public_article_id = EXCLUDED.public_article_id,
-    topic_id          = EXCLUDED.topic_id,
-    metadata          = EXCLUDED.metadata,
-    updated_at        = now()"""
+# ── DML (delete / insert chunks) ─────────────────────────────────────────────
 
 _DML_DELETE_CHUNKS = "DELETE FROM {schema}.{chunks_table} WHERE article_id = :article_id"
 
@@ -78,44 +213,6 @@ VALUES
     (:article_id, :chunk_index, :content,
      CAST(:dense_vector AS vector),
      CAST(:sparse_vector AS sparsevec))"""
-
-# ── DQL (search) ────────────────────────────────────────────────────────────
-
-_DQL_SEARCH_DENSE = """\
-SELECT
-    ac.id                    AS chunk_id,
-    ac.article_id,
-    ac.chunk_index,
-    ac.content,
-    a.title,
-    a.url,
-    a.public_article_id,
-    a.topic_id,
-    ac.dense_vector <=> CAST(:query_vec AS vector) AS distance
-FROM {schema}.{chunks_table} ac
-JOIN {schema}.{articles_table} a ON ac.article_id = a.id
-WHERE ac.dense_vector IS NOT NULL
-  AND (:topic_id IS NULL OR a.topic_id = CAST(:topic_id AS UUID))
-ORDER BY distance
-LIMIT :top_k"""
-
-_DQL_SEARCH_SPARSE = """\
-SELECT
-    ac.id                    AS chunk_id,
-    ac.article_id,
-    ac.chunk_index,
-    ac.content,
-    a.title,
-    a.url,
-    a.public_article_id,
-    a.topic_id,
-    (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance
-FROM {schema}.{chunks_table} ac
-JOIN {schema}.{articles_table} a ON ac.article_id = a.id
-WHERE ac.sparse_vector IS NOT NULL
-  AND (:topic_id IS NULL OR a.topic_id = CAST(:topic_id AS UUID))
-ORDER BY distance
-LIMIT :top_k"""
 
 
 def _dense_col_ddl(dense_dim: int | None) -> str:
