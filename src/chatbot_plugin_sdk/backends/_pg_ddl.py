@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from collections.abc import Mapping
+
 from chatbot_plugin_sdk.exceptions import DatabaseError
 
 _ARTICLE_COLUMNS = frozenset({
@@ -24,15 +26,18 @@ _ARTICLE_COLUMNS = frozenset({
 })
 
 
-def _split_article_fields(
-    metadata: dict,
+def _prepare_upsert_params(
+    metadata: dict | None = None,
     article_columns: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict | None]:
-    """Split article-level fields from metadata into SQL column params vs JSONB blob."""
+    """Prepare SQL column params from article_columns and JSONB blob from metadata.
+
+    ``article_columns`` is the sole source of SQL column values — keys are
+    validated against ``_ARTICLE_COLUMNS``.  ``metadata`` is opaque: it goes
+    entirely into the JSONB ``metadata`` column; the SDK never extracts keys
+    from it.
+    """
     col_params: dict[str, Any] = {}
-    for key in ("url", "title", "source", "public_article_id"):
-        if key in metadata:
-            col_params[key] = metadata[key]
 
     if article_columns:
         for key, value in article_columns.items():
@@ -43,10 +48,30 @@ def _split_article_fields(
                 )
             col_params[key] = value
 
-    jsonb_keys = set(metadata.keys()) - _ARTICLE_COLUMNS
-    jsonb_metadata = {k: metadata[k] for k in jsonb_keys if k in metadata} or None
+    jsonb_metadata = dict(metadata) if metadata else None
 
     return col_params, jsonb_metadata
+
+
+_CHUNK_RESULT_KEYS = frozenset({
+    "chunk_id", "article_id", "chunk_index", "content", "distance",
+})
+
+
+def _extract_article_metadata(
+    row_mapping: Mapping,
+    columns: frozenset = _ARTICLE_COLUMNS,
+) -> dict[str, Any]:
+    """Extract article-level column values from a SQL result row mapping.
+
+    Returns a dict containing only the article columns (e.g. ``title``,
+    ``url``, ``source``, ``public_article_id``, ``topic_id``) that are
+    present in the row, filtering out chunk-level fields and ``None`` values.
+    """
+    return {
+        k: v for k in columns
+        if k in row_mapping and row_mapping[k] is not None
+    }
 
 
 def _build_upsert_article_sql(
@@ -118,15 +143,14 @@ def _build_search_dense_sql(
     filters: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     where_frag, filter_params = _build_search_where(filters)
+    article_selects = ", ".join(f"a.{c}" for c in sorted(_ARTICLE_COLUMNS))
     sql = (
         f"SELECT\n"
         f"    ac.id                    AS chunk_id,\n"
         f"    ac.article_id,\n"
         f"    ac.chunk_index,\n"
         f"    ac.content,\n"
-        f"    a.title,\n"
-        f"    a.url,\n"
-        f"    a.public_article_id,\n"
+        f"    {article_selects},\n"
         f"    ac.dense_vector <=> CAST(:query_vec AS vector) AS distance\n"
         f"FROM {schema}.{chunks_table} ac\n"
         f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"
@@ -145,15 +169,14 @@ def _build_search_sparse_sql(
     filters: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     where_frag, filter_params = _build_search_where(filters)
+    article_selects = ", ".join(f"a.{c}" for c in sorted(_ARTICLE_COLUMNS))
     sql = (
         f"SELECT\n"
         f"    ac.id                    AS chunk_id,\n"
         f"    ac.article_id,\n"
         f"    ac.chunk_index,\n"
         f"    ac.content,\n"
-        f"    a.title,\n"
-        f"    a.url,\n"
-        f"    a.public_article_id,\n"
+        f"    {article_selects},\n"
         f"    (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance\n"
         f"FROM {schema}.{chunks_table} ac\n"
         f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"

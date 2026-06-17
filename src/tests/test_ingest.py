@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import uuid
 
 from chatbot_plugin_sdk import (
     IngestProcessor,
@@ -123,36 +124,52 @@ class TestIngestPipeline:
     async def test_raises_without_configure(self):
         processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
-            await processor.ingest("hello", metadata={"url": "https://example.com"})
+            await processor.ingest("hello", article_id="550e8400-e29b-41d4-a716-446655440000")
 
     @pytest.mark.asyncio
     async def test_raises_on_empty_text(self):
         processor, _ = _configured_processor()
         with pytest.raises(DatabaseError):
-            await processor.ingest("   ", metadata={"url": "https://example.com"})
-
-    @pytest.mark.asyncio
-    async def test_raises_when_url_missing(self):
-        processor, _ = _configured_processor()
-        with pytest.raises(DatabaseError, match="url"):
-            await processor.ingest("some text content", metadata={})
+            await processor.ingest("   ", article_id="550e8400-e29b-41d4-a716-446655440000")
 
     @pytest.mark.asyncio
     async def test_calls_backend_upsert(self):
         processor, backend = _configured_processor()
+        article_id = "550e8400-e29b-41d4-a716-446655440000"
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                metadata={"url": "https://example.com/article", "title": "Test"},
+                article_id=article_id,
+                article_columns={"url": "https://example.com/article", "title": "Test"},
             )
         mock_embed.assert_called_once()
         backend.upsert.assert_called_once()
-        _, call_kwargs = backend.upsert.call_args
-        # positional: article_id, metadata, chunks, dense_vectors, sparse_vectors
         call_args = backend.upsert.call_args.args
-        assert call_args[1]["url"] == "https://example.com/article"
+        assert call_args[0] == uuid.UUID(article_id)
         assert call_args[4] is None  # no sparse provider
+
+    @pytest.mark.asyncio
+    async def test_article_id_passed_through_to_backend(self):
+        processor, backend = _configured_processor()
+        article_id = uuid.uuid4()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest("text " * 200, article_id=article_id)
+
+        actual_id = backend.upsert.call_args.args[0]
+        assert actual_id == article_id
+
+    @pytest.mark.asyncio
+    async def test_article_id_string_converted_to_uuid(self):
+        processor, backend = _configured_processor()
+        article_id_str = "550e8400-e29b-41d4-a716-446655440000"
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest("text " * 200, article_id=article_id_str)
+
+        actual_id = backend.upsert.call_args.args[0]
+        assert actual_id == uuid.UUID(article_id_str)
 
     @pytest.mark.asyncio
     async def test_raises_on_dense_vector_count_mismatch(self):
@@ -162,20 +179,26 @@ class TestIngestPipeline:
             with pytest.raises(DatabaseError, match="Dense embedding returned"):
                 await processor.ingest(
                     "Hello world. " * 100,
-                    metadata={"url": "https://example.com/article"},
+                    article_id="550e8400-e29b-41d4-a716-446655440000",
                 )
 
     @pytest.mark.asyncio
-    async def test_article_id_is_deterministic_from_url(self):
-        import uuid
+    async def test_metadata_not_promoted_to_sql_columns(self):
+        """metadata keys should never be auto-promoted to SQL columns."""
         processor, backend = _configured_processor()
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
-            await processor.ingest("text " * 200, metadata={"url": "https://example.com/x"})
+            await processor.ingest(
+                "Hello world. " * 100,
+                article_id="550e8400-e29b-41d4-a716-446655440000",
+                metadata={"url": "https://example.com/a", "title": "Test"},
+            )
 
-        expected_id = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/x")
-        actual_id = backend.upsert.call_args.args[0]
-        assert actual_id == expected_id
+        # metadata should be passed through as-is (opaque JSONB)
+        call_args = backend.upsert.call_args.args
+        metadata_arg = call_args[1]
+        assert metadata_arg["url"] == "https://example.com/a"
+        assert metadata_arg["title"] == "Test"
 
 
 # ── ingest(article_columns=...) ──────────────────────────────────────────────────────
@@ -188,12 +211,12 @@ class TestIngestArticleColumns:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                metadata={"url": "https://example.com/a", "title": "Test"},
-                article_columns={"topic_id": "some-uuid"},
+                article_id="550e8400-e29b-41d4-a716-446655440000",
+                article_columns={"url": "https://example.com/a", "title": "Test", "topic_id": "some-uuid"},
             )
 
         call_kwargs = backend.upsert.call_args.kwargs
-        assert call_kwargs.get("article_columns") == {"topic_id": "some-uuid"}
+        assert call_kwargs.get("article_columns") == {"url": "https://example.com/a", "title": "Test", "topic_id": "some-uuid"}
 
     @pytest.mark.asyncio
     async def test_article_columns_default_none(self):
@@ -202,7 +225,7 @@ class TestIngestArticleColumns:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                metadata={"url": "https://example.com/a", "title": "Test"},
+                article_id="550e8400-e29b-41d4-a716-446655440000",
             )
 
         call_kwargs = backend.upsert.call_args.kwargs

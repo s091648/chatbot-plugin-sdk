@@ -3,7 +3,8 @@ import pytest
 
 from chatbot_plugin_sdk.backends._pg_ddl import (
     _ARTICLE_COLUMNS,
-    _split_article_fields,
+    _prepare_upsert_params,
+    _extract_article_metadata,
     _build_search_where,
     _build_upsert_article_sql,
     _build_search_dense_sql,
@@ -21,32 +22,71 @@ class TestArticleColumns:
         assert "public_article_id" in _ARTICLE_COLUMNS
 
 
-class TestSplitArticleFields:
-    def test_splits_core_fields(self):
+class TestPrepareUpsertParams:
+    def test_metadata_not_promoted_to_sql_cols(self):
+        """metadata keys are never auto-promoted to SQL columns."""
         metadata = {"url": "https://x.com", "title": "T", "extra_key": "val"}
-        col_params, jsonb = _split_article_fields(metadata)
-        assert col_params["url"] == "https://x.com"
-        assert col_params["title"] == "T"
-        assert jsonb == {"extra_key": "val"}
+        col_params, jsonb = _prepare_upsert_params(metadata)
+        assert col_params == {}
+        assert jsonb == {"url": "https://x.com", "title": "T", "extra_key": "val"}
 
-    def test_article_columns_override(self):
+    def test_article_columns_provide_sql_values(self):
         metadata = {"url": "https://x.com"}
-        col_params, jsonb = _split_article_fields(
+        col_params, jsonb = _prepare_upsert_params(
             metadata, article_columns={"topic_id": "uuid-123"}
         )
         assert col_params["topic_id"] == "uuid-123"
+        assert jsonb == {"url": "https://x.com"}
 
     def test_article_columns_invalid_key_raises(self):
         with pytest.raises(DatabaseError, match="not a known article column"):
-            _split_article_fields(
+            _prepare_upsert_params(
                 {"url": "https://x.com"},
                 article_columns={"nonexistent_col": "val"},
             )
 
     def test_no_jsonb_when_empty(self):
-        metadata = {"url": "https://x.com", "title": "T"}
-        _, jsonb = _split_article_fields(metadata)
+        col_params, jsonb = _prepare_upsert_params()
+        assert col_params == {}
         assert jsonb is None
+
+    def test_metadata_none(self):
+        col_params, jsonb = _prepare_upsert_params(
+            metadata=None, article_columns={"url": "https://x.com"}
+        )
+        assert col_params == {"url": "https://x.com"}
+        assert jsonb is None
+
+
+class TestExtractArticleMetadata:
+    def test_extracts_article_columns(self):
+        row = {
+            "chunk_id": "c1",
+            "article_id": "a1",
+            "chunk_index": 0,
+            "content": "text",
+            "distance": 0.2,
+            "title": "My Article",
+            "url": "https://example.com",
+            "source": "wiki",
+            "public_article_id": "uuid-123",
+            "topic_id": None,
+        }
+        result = _extract_article_metadata(row, _ARTICLE_COLUMNS)
+        assert result == {
+            "title": "My Article",
+            "url": "https://example.com",
+            "source": "wiki",
+            "public_article_id": "uuid-123",
+        }
+        assert "topic_id" not in result  # None values excluded
+        assert "chunk_id" not in result
+        assert "content" not in result
+
+    def test_empty_when_no_article_columns_present(self):
+        row = {"chunk_id": "c1", "article_id": "a1", "content": "text", "distance": 0.2}
+        result = _extract_article_metadata(row, _ARTICLE_COLUMNS)
+        assert result == {}
 
 
 class TestBuildSearchWhere:
@@ -103,6 +143,11 @@ class TestBuildSearchDenseSql:
         assert "WHERE ac.dense_vector IS NOT NULL" in sql
         assert params == {}
 
+    def test_includes_all_article_columns_in_select(self):
+        sql, _ = _build_search_dense_sql("vectors", "articles", "chunks")
+        for col in _ARTICLE_COLUMNS:
+            assert f"a.{col}" in sql
+
     def test_with_filters(self):
         sql, params = _build_search_dense_sql(
             "vectors", "articles", "chunks",
@@ -118,6 +163,11 @@ class TestBuildSearchSparseSql:
         assert "WHERE ac.sparse_vector IS NOT NULL" in sql
         assert "sparse_vector <#>" in sql
         assert params == {}
+
+    def test_includes_all_article_columns_in_select(self):
+        sql, _ = _build_search_sparse_sql("vectors", "articles", "chunks")
+        for col in _ARTICLE_COLUMNS:
+            assert f"a.{col}" in sql
 
     def test_with_filters(self):
         sql, params = _build_search_sparse_sql(

@@ -9,7 +9,7 @@ class ArticleInfo(BaseModel):
     """Article metadata included in a store-chunks request."""
 
     id: str = Field(..., description="Article UUID (upsert key)")
-    url: str = Field(..., description="Source URL")
+    url: str | None = Field(default=None, description="Source URL — an article_columns value, not a first-class SDK concept")
     title: str | None = Field(default=None, description="Article title")
     source: str | None = Field(default=None, description="Source domain / feed name")
     metadata: dict | None = Field(default=None, description="Arbitrary JSON metadata")

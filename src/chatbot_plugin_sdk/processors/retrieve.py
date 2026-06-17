@@ -170,9 +170,7 @@ class RetrieveProcessor:
                 ChunkResult(
                     chunk_id=r.chunk_id,
                     article_id=r.article_id,
-                    article_title=r.title,
-                    article_url=r.url,
-                    public_article_id=r.public_article_id,
+                    article_metadata=r.article_metadata,
                     chunk_index=r.chunk_index,
                     content=r.content,
                     score=round(s, 6),
@@ -188,9 +186,7 @@ class RetrieveProcessor:
                 ChunkResult(
                     chunk_id=r.chunk_id,
                     article_id=r.article_id,
-                    article_title=r.title,
-                    article_url=r.url,
-                    public_article_id=r.public_article_id,
+                    article_metadata=r.article_metadata,
                     chunk_index=r.chunk_index,
                     content=r.content,
                     score=round(rrf_scores[r.chunk_id], 6),
@@ -205,9 +201,7 @@ class RetrieveProcessor:
             ChunkResult(
                 chunk_id=r.chunk_id,
                 article_id=r.article_id,
-                article_title=r.title,
-                article_url=r.url,
-                public_article_id=r.public_article_id,
+                article_metadata=r.article_metadata,
                 chunk_index=r.chunk_index,
                 content=r.content,
                 score=round(1.0 - r.distance, 6),

@@ -35,6 +35,7 @@ import logging
 
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
+    _ARTICLE_COLUMNS,
     _build_search_dense_sql,
     _build_search_sparse_sql,
     _build_upsert_article_sql,
@@ -47,7 +48,8 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_TABLE_EXISTS,
     _DML_DELETE_CHUNKS,
     _DML_INSERT_CHUNK,
-    _split_article_fields,
+    _extract_article_metadata,
+    _prepare_upsert_params,
     _check_dim_from_cols,
     _check_sparse_dim_from_cols,
     _dense_col_ddl,
@@ -196,7 +198,7 @@ class SyncPgBackend:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
-        col_params, jsonb_metadata = _split_article_fields(metadata, article_columns)
+        col_params, jsonb_metadata = _prepare_upsert_params(metadata, article_columns)
         try:
             with self._engine.begin() as conn:
                 sql = _build_upsert_article_sql(schema, at, col_params)
@@ -246,10 +248,8 @@ class SyncPgBackend:
                 article_id=str(r.article_id),
                 chunk_index=r.chunk_index,
                 content=r.content,
-                title=r.title,
-                url=r.url,
                 distance=float(r.distance),
-                public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
             )
             for r in rows
         ]
@@ -272,10 +272,8 @@ class SyncPgBackend:
                 article_id=str(r.article_id),
                 chunk_index=r.chunk_index,
                 content=r.content,
-                title=r.title,
-                url=r.url,
                 distance=float(r.distance),
-                public_article_id=str(r.public_article_id) if r.public_article_id else None,
+                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
             )
             for r in rows
         ]

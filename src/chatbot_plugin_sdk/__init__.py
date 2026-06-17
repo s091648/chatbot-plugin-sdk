@@ -20,7 +20,11 @@ Quick start::
         backend=backend,
         dense=EndpointProvider(url="http://embed:8080", dimension=768),
     )
-    await processor.ingest(full_text="...", metadata={"url": "https://...", "title": "..."})
+    await processor.ingest(
+        full_text="...",
+        article_id="550e8400-e29b-41d4-a716-446655440000",
+        article_columns={"url": "https://...", "title": "..."},
+    )
 
 Logging:
     This package follows PEP 396 — a NullHandler is added at the package level

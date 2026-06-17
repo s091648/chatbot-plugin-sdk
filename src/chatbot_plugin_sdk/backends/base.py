@@ -13,10 +13,8 @@ class SearchRow:
     article_id: str
     chunk_index: int
     content: str
-    title: str | None
-    url: str | None
     distance: float   # raw cosine distance (0 = identical, 2 = opposite)
-    public_article_id: str | None = None  # UUID of the record in the source application DB
+    article_metadata: dict[str, Any]  # article-level columns (title, url, etc.)
 
 
 @runtime_checkable
@@ -73,9 +71,11 @@ class DatabaseBackend(Protocol):
         """Insert-or-replace article + chunks inside a single transaction.
 
         Args:
-            article_columns: Explicit column values for the articles table.
+            metadata: Opaque JSONB blob — the SDK never interprets its keys.
+            article_columns: SQL column values for the articles table.
                               Keys must be in the known article column set.
-                              These override matching keys from metadata.
+                              This is the sole source of SQL column values;
+                              ``metadata`` keys are never promoted to columns.
 
         On success: commits.  On any error: rolls back, raises :exc:`DatabaseError`.
         """

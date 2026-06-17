@@ -34,7 +34,11 @@ class IngestProcessor:
         )
         await processor.ingest(
             full_text="...",
-            metadata={"url": "https://example.com/article", "title": "My Article"},
+            article_id="550e8400-e29b-41d4-a716-446655440000",
+            article_columns={
+                "url": "https://example.com/article",
+                "title": "My Article",
+            },
         )
 
     Thread-safety notes:
@@ -89,24 +93,27 @@ class IngestProcessor:
     async def ingest(
         self,
         full_text: str,
-        metadata: dict[str, Any] | None = None,
+        article_id: str | uuid.UUID,
         article_columns: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Full ingest pipeline: normalize → chunk → embed → upsert.
 
         Args:
             full_text: Raw article text (HTML-stripped or plain).
-            metadata:  Must contain ``url`` (str) for idempotent upsert keying.
-                       Also accepts ``title``, ``source``, and ``public_article_id``
-                       (UUID string of the corresponding record in the source
-                       database, used for cross-schema joins).
+            article_id: Unique identifier for this article (UUID or UUID string).
+                        Used as the primary key for idempotent upserts.
+            article_columns: SQL column values for the articles table (e.g.
+                              ``{"url": "...", "title": "...", "source": "..."}``).
+                              Keys must belong to the known article column set.
+                              This is the sole source of SQL column values; the
+                              ``metadata`` dict is never promoted to columns.
+            metadata: Opaque JSONB metadata — the SDK never interprets its keys.
         """
         await self._ensure_ready()
 
-        metadata = metadata or {}
-        url = metadata.get("url", "")
-        if not url:
-            raise DatabaseError("metadata must contain 'url' to ensure idempotent ingest.")
+        if isinstance(article_id, str):
+            article_id = uuid.UUID(article_id)
 
         normalized = self._normalize(full_text)
         if not normalized:
@@ -135,12 +142,11 @@ class IngestProcessor:
                     f"but {len(chunks)} chunks expected."
                 )
 
-        article_id = uuid.uuid5(uuid.NAMESPACE_URL, url)
-        logger.debug("ingest_upserting", extra={"url": url, "chunk_count": len(chunks)})
-        await self._backend.upsert(article_id, metadata, chunks, dense_vectors, sparse_vectors,
+        logger.debug("ingest_upserting", extra={"article_id": str(article_id), "chunk_count": len(chunks)})
+        await self._backend.upsert(article_id, metadata or {}, chunks, dense_vectors, sparse_vectors,
             article_columns=article_columns,
         )
         logger.info(
             "ingest_complete",
-            extra={"url": url, "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
+            extra={"article_id": str(article_id), "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
         )
