@@ -90,6 +90,7 @@ class IngestProcessor:
         self,
         full_text: str,
         metadata: dict[str, Any] | None = None,
+        article_columns: dict[str, Any] | None = None,
     ) -> None:
         """Full ingest pipeline: normalize → chunk → embed → upsert.
 
@@ -136,7 +137,9 @@ class IngestProcessor:
 
         article_id = uuid.uuid5(uuid.NAMESPACE_URL, url)
         logger.debug("ingest_upserting", extra={"url": url, "chunk_count": len(chunks)})
-        await self._backend.upsert(article_id, metadata, chunks, dense_vectors, sparse_vectors)
+        await self._backend.upsert(article_id, metadata, chunks, dense_vectors, sparse_vectors,
+            article_columns=article_columns,
+        )
         logger.info(
             "ingest_complete",
             extra={"url": url, "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},

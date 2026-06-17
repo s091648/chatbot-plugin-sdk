@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
@@ -110,7 +111,7 @@ class RetrieveProcessor:
         self._ready = True
         logger.info("retrieve_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
-    async def retrieve(self, query: str, top_k: int = 10, min_score: float = 0.0, min_rerank_score: float = 0.0, topic_id: str | None = None) -> SearchResponse:
+    async def retrieve(self, query: str, top_k: int = 10, min_score: float = 0.0, min_rerank_score: float = 0.0, filters: dict[str, Any] | None = None) -> SearchResponse:
         """Retrieve the top-k chunks most semantically similar to the query.
 
         Hybrid mode (dense + sparse): fetches ``top_k * 3`` candidates from each source,
@@ -126,7 +127,8 @@ class RetrieveProcessor:
             "retrieve_start",
             extra={"query_len": len(query), "top_k": top_k, "candidate_k": candidate_k,
                    "mode": "hybrid" if (self._dense and self._sparse) else "dense" if self._dense else "sparse",
-                   "reranker": type(self._reranker).__name__ if self._reranker else None},
+                   "reranker": type(self._reranker).__name__ if self._reranker else None,
+                   "filters": filters},
         )
 
         # ── Retrieval ─────────────────────────────────────────────────────────
@@ -136,8 +138,8 @@ class RetrieveProcessor:
                 self._sparse.embed([query]),
             )
             dense_rows, sparse_rows = await _gather(
-                self._backend.search_dense(dense_vecs[0], candidate_k, topic_id=topic_id),
-                self._backend.search_sparse(sparse_vecs[0], candidate_k, topic_id=topic_id),
+                self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters),
+                self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters),
             )
             merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
             ranked_rows = [r for r, _ in merged]
@@ -147,14 +149,14 @@ class RetrieveProcessor:
 
         elif self._dense is not None:
             dense_vecs = await self._dense.embed([query])
-            ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k, topic_id=topic_id)
+            ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (1.0 - r.distance) >= min_score]
 
         else:
             sparse_vecs = await self._sparse.embed([query])  # type: ignore[union-attr]
-            ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k, topic_id=topic_id)
+            ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (-r.distance) >= min_score]
