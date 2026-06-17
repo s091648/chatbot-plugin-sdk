@@ -176,3 +176,34 @@ class TestIngestPipeline:
         expected_id = uuid.uuid5(uuid.NAMESPACE_URL, "https://example.com/x")
         actual_id = backend.upsert.call_args.args[0]
         assert actual_id == expected_id
+
+
+# ── ingest(article_columns=...) ──────────────────────────────────────────────────────
+
+class TestIngestArticleColumns:
+    @pytest.mark.asyncio
+    async def test_passes_article_columns_to_backend(self):
+        processor, backend = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
+                "Hello world. " * 100,
+                metadata={"url": "https://example.com/a", "title": "Test"},
+                article_columns={"topic_id": "some-uuid"},
+            )
+
+        call_kwargs = backend.upsert.call_args.kwargs
+        assert call_kwargs.get("article_columns") == {"topic_id": "some-uuid"}
+
+    @pytest.mark.asyncio
+    async def test_article_columns_default_none(self):
+        processor, backend = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
+                "Hello world. " * 100,
+                metadata={"url": "https://example.com/a", "title": "Test"},
+            )
+
+        call_kwargs = backend.upsert.call_args.kwargs
+        assert call_kwargs.get("article_columns") is None

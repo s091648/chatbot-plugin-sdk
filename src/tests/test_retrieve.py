@@ -357,3 +357,53 @@ class TestRetrieveScoreGating:
             mock_embed.return_value = [[0.1] * 768]
             result = await retriever.retrieve("q", min_score=0.5)
         assert result.chunks == []
+
+
+# ── retrieve(filters=...) ──────────────────────────────────────────────────────────
+
+class TestRetrieveFilters:
+    @pytest.mark.asyncio
+    async def test_passes_filters_to_backend(self):
+        retriever, backend = _configured_retriever()
+        backend.search_dense.return_value = []
+        with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            await retriever.retrieve("q", filters={"topic_id": "some-uuid"})
+
+        call_kwargs = backend.search_dense.call_args.kwargs
+        assert call_kwargs["filters"] == {"topic_id": "some-uuid"}
+
+    @pytest.mark.asyncio
+    async def test_filters_default_none(self):
+        retriever, backend = _configured_retriever()
+        backend.search_dense.return_value = []
+        with patch.object(retriever._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            await retriever.retrieve("q")
+
+        call_kwargs = backend.search_dense.call_args.kwargs
+        assert call_kwargs.get("filters") is None
+
+    @pytest.mark.asyncio
+    async def test_hybrid_passes_filters_to_both_backends(self):
+        backend = _mock_backend()
+        backend.search_dense.return_value = [_make_row("c1", "a1", 0, "t", "T", "u", 0.1)]
+        backend.search_sparse.return_value = [_make_row("c2", "a2", 0, "t", "T", "u", -0.9)]
+
+        dense = EndpointProvider(url="http://x", dimension=768)
+        sparse = MagicMock()
+        sparse.dimension = 30522
+        sparse.embed = AsyncMock(return_value=[{"0": 0.5, "1": 0.3}])
+
+        retriever = RetrieveProcessor()
+        retriever.configure(backend=backend, dense=dense, sparse=sparse)
+        retriever._ready = True
+
+        with patch.object(dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.return_value = [[0.1] * 768]
+            await retriever.retrieve("q", filters={"source": "wiki"})
+
+        dense_kwargs = backend.search_dense.call_args.kwargs
+        sparse_kwargs = backend.search_sparse.call_args.kwargs
+        assert dense_kwargs["filters"] == {"source": "wiki"}
+        assert sparse_kwargs["filters"] == {"source": "wiki"}
