@@ -53,14 +53,22 @@ class IngestProcessor:
         self._dense: DenseEmbeddingProvider | None = None
         self._sparse: SparseEmbeddingProvider | None = None
         self._ready: bool = False
+        self._embed_batch_size: int = 16
 
     def configure(
         self,
         backend: DatabaseBackend,
         dense: DenseEmbeddingProvider | None = None,
         sparse: SparseEmbeddingProvider | None = None,
+        embed_batch_size: int = 16,
     ) -> None:
-        """Bind backend + providers.  Pure sync, no I/O."""
+        """Bind backend + providers.  Pure sync, no I/O.
+
+        Args:
+            embed_batch_size: Max chunks sent to each provider's ``embed()`` per
+                              call. Smaller values reduce peak memory when using
+                              local ONNX models (e.g. SPLADE). Default: 16.
+        """
         if dense is None and sparse is None:
             raise NotConfiguredError(
                 "至少需要配置 dense 或 sparse 其中一種 embedding provider。"
@@ -68,6 +76,7 @@ class IngestProcessor:
         self._backend = backend
         self._dense = dense
         self._sparse = sparse
+        self._embed_batch_size = embed_batch_size
         self._ready = False
 
     async def _ensure_ready(self) -> None:
@@ -82,6 +91,20 @@ class IngestProcessor:
         await self._backend.setup(dense_dim, sparse_dim)
         self._ready = True
         logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
+
+    async def _embed_in_batches_dense(self, chunks: list[str]) -> list[list[float]]:
+        results: list[list[float]] = []
+        for i in range(0, len(chunks), self._embed_batch_size):
+            batch = chunks[i : i + self._embed_batch_size]
+            results.extend(await self._dense.embed(batch))  # type: ignore[union-attr]
+        return results
+
+    async def _embed_in_batches_sparse(self, chunks: list[str]) -> list[dict[str, float]]:
+        results: list[dict[str, float]] = []
+        for i in range(0, len(chunks), self._embed_batch_size):
+            batch = chunks[i : i + self._embed_batch_size]
+            results.extend(await self._sparse.embed(batch))  # type: ignore[union-attr]
+        return results
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -130,7 +153,7 @@ class IngestProcessor:
         sparse_vectors: list[dict[str, float]] | None = None
 
         if self._dense is not None:
-            dense_vectors = await self._dense.embed(chunks)
+            dense_vectors = await self._embed_in_batches_dense(chunks)
             if len(dense_vectors) != len(chunks):
                 raise DatabaseError(
                     f"Dense embedding returned {len(dense_vectors)} vectors "
@@ -138,14 +161,17 @@ class IngestProcessor:
                 )
 
         if self._sparse is not None:
-            sparse_vectors = await self._sparse.embed(chunks)
+            sparse_vectors = await self._embed_in_batches_sparse(chunks)
             if len(sparse_vectors) != len(chunks):
                 raise DatabaseError(
                     f"Sparse embedding returned {len(sparse_vectors)} vectors "
                     f"but {len(chunks)} chunks expected."
                 )
 
-        logger.debug("ingest_upserting", extra={"url": url, "chunk_count": len(chunks)})
+        logger.debug(
+            "ingest_upserting",
+            extra={"url": url, "chunk_count": len(chunks), "embed_batch_size": self._embed_batch_size},
+        )
         await self._backend.upsert(
             article_id,
             metadata or {},
