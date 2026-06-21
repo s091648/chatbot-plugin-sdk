@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-
+from chatbot_plugin_sdk.config import FASTEMBED_CACHE_PATH
 from chatbot_plugin_sdk.providers.local import LocalProvider
 
 
@@ -11,7 +10,7 @@ class FastEmbedDenseProvider:
     fastembed is loaded lazily; ``ImportError`` propagates to the caller if the
     ``fastembed`` optional dependency is not installed.
 
-    Respects ``FASTEMBED_CACHE_PATH`` env var for model storage.
+    Respects ``FASTEMBED_CACHE_PATH`` env var for model storage (read via config).
 
     Args:
         batch_size: Number of texts per ONNX inference call. Lower values reduce
@@ -20,7 +19,7 @@ class FastEmbedDenseProvider:
 
     def __init__(self, model: str, dimension: int, batch_size: int = 32) -> None:
         from fastembed import TextEmbedding
-        cache_dir = os.getenv("FASTEMBED_CACHE_PATH") or None
+        cache_dir = FASTEMBED_CACHE_PATH
         _model = TextEmbedding(model, cache_dir=cache_dir)
         _batch_size = batch_size
         self._provider = LocalProvider(
@@ -46,7 +45,7 @@ class FastEmbedSparseProvider:
 
     def __init__(self, model: str, dimension: int, batch_size: int = 8) -> None:
         from fastembed import SparseTextEmbedding
-        cache_dir = os.getenv("FASTEMBED_CACHE_PATH") or None
+        cache_dir = FASTEMBED_CACHE_PATH
         _model = SparseTextEmbedding(model, cache_dir=cache_dir)
         _batch_size = batch_size
         self._provider = LocalProvider(

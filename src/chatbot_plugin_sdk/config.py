@@ -1,5 +1,11 @@
 from __future__ import annotations
+
+import os
 from dataclasses import dataclass
+
+# Directory where fastembed downloads and caches ONNX models.
+# Leave unset to use fastembed's default (~/.cache/fastembed).
+FASTEMBED_CACHE_PATH: str | None = os.environ.get("FASTEMBED_CACHE_PATH") or None
 
 
 @dataclass
