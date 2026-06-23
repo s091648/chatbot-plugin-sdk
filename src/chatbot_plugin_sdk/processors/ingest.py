@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 from chatbot_plugin_sdk.backends.base import DatabaseBackend
-from chatbot_plugin_sdk.chunking import _chunk_text
+from chatbot_plugin_sdk.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, _chunk_text
 from chatbot_plugin_sdk.exceptions import DatabaseError, NotConfiguredError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
 
@@ -54,6 +54,8 @@ class IngestProcessor:
         self._sparse: SparseEmbeddingProvider | None = None
         self._ready: bool = False
         self._embed_batch_size: int = 16
+        self._chunk_size: int = DEFAULT_CHUNK_SIZE
+        self._chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
 
     def configure(
         self,
@@ -61,6 +63,8 @@ class IngestProcessor:
         dense: DenseEmbeddingProvider | None = None,
         sparse: SparseEmbeddingProvider | None = None,
         embed_batch_size: int = 16,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
         """Bind backend + providers.  Pure sync, no I/O.
 
@@ -68,6 +72,8 @@ class IngestProcessor:
             embed_batch_size: Max chunks sent to each provider's ``embed()`` per
                               call. Smaller values reduce peak memory when using
                               local ONNX models (e.g. SPLADE). Default: 16.
+            chunk_size: Maximum characters per chunk. Default: 500.
+            chunk_overlap: Overlap characters between consecutive chunks. Default: 50.
         """
         if dense is None and sparse is None:
             raise NotConfiguredError(
@@ -77,6 +83,8 @@ class IngestProcessor:
         self._dense = dense
         self._sparse = sparse
         self._embed_batch_size = embed_batch_size
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
         self._ready = False
 
     async def _ensure_ready(self) -> None:
@@ -145,7 +153,7 @@ class IngestProcessor:
         if not normalized:
             raise DatabaseError("Empty text after normalization.")
 
-        chunks = _chunk_text(normalized)
+        chunks = _chunk_text(normalized, chunk_size=self._chunk_size, overlap=self._chunk_overlap)
         if not chunks:
             raise DatabaseError("No chunks produced — input text may be too short.")
 
