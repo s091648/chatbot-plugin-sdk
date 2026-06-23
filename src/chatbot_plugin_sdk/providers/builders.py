@@ -4,16 +4,17 @@ from __future__ import annotations
 from chatbot_plugin_sdk.providers.endpoint import EndpointProvider
 from chatbot_plugin_sdk.providers.fastembed import FastEmbedDenseProvider, FastEmbedSparseProvider
 from chatbot_plugin_sdk.providers.gemini import GeminiDenseProvider
+from chatbot_plugin_sdk.providers.huggingface import HuggingFaceDenseProvider
 
 
 def build_dense_provider(config: dict):
     """Instantiate a dense embedding provider from a config dict.
 
     Config keys:
-        provider_type: ``"local"`` (fastembed), ``"gemini"``, or ``"endpoint"``.
-        model: Model name (required for ``local`` and ``gemini``).
+        provider_type: ``"local"`` (fastembed), ``"gemini"``, ``"huggingface"``, or ``"endpoint"``.
+        model: Model name / repo ID (required for ``local``, ``gemini``, and ``huggingface``).
         dimension: Vector dimension (required for all provider types).
-        api_key: API key (for ``gemini``; or Bearer token for ``endpoint``).
+        api_key: API key / token (for ``gemini`` and ``huggingface``; Bearer token for ``endpoint``).
         endpoint_url: Service URL (for ``endpoint``).
         rpm / tpm / rpd: Rate-limit parameters (all three required to enable limiting).
 
@@ -34,6 +35,18 @@ def build_dense_provider(config: dict):
             rate_limit = SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd)
         return GeminiDenseProvider(
             api_key=config.get("api_key", ""),
+            model=model,
+            dimension=dimension,
+            rate_limit=rate_limit,
+        )
+
+    if provider_type == "huggingface":
+        rate_limit = None
+        if all(v is not None for v in (rpm, tpm, rpd)):
+            from chatbot_plugin_sdk.rate_limit import SlidingWindowStrategy
+            rate_limit = SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd)
+        return HuggingFaceDenseProvider(
+            api_token=config.get("api_key", ""),
             model=model,
             dimension=dimension,
             rate_limit=rate_limit,
