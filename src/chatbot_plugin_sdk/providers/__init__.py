@@ -2,6 +2,8 @@ from .local import LocalProvider
 from .endpoint import EndpointProvider
 from .fastembed import FastEmbedDenseProvider, FastEmbedSparseProvider
 from .gemini import GeminiDenseProvider
+from .huggingface import HuggingFaceDenseProvider
+from .builders import build_dense_provider, build_sparse_provider
 
 __all__ = [
     "LocalProvider",
@@ -9,92 +11,7 @@ __all__ = [
     "FastEmbedDenseProvider",
     "FastEmbedSparseProvider",
     "GeminiDenseProvider",
+    "HuggingFaceDenseProvider",
     "build_dense_provider",
     "build_sparse_provider",
 ]
-
-
-def build_dense_provider(config: dict):
-    """Instantiate a dense embedding provider from a config dict.
-
-    Config keys:
-        provider_type: ``"local"`` (fastembed), ``"gemini"``, or ``"endpoint"``.
-        model: Model name (required for ``local`` and ``gemini``).
-        dimension: Vector dimension (required for ``local``, ``gemini``, ``endpoint``).
-        api_key: API key (for ``gemini``; or Bearer token for ``endpoint``).
-        endpoint_url: Service URL (for ``endpoint``).
-        rpm / tpm / rpd: Rate-limit parameters (all three required to enable limiting).
-
-    Returns ``None`` when ``provider_type`` is empty or unrecognised.
-    """
-    provider_type = config.get("provider_type", "")
-    model = config.get("model", "")
-    dimension = config.get("dimension", 768)
-    rpm, tpm, rpd = config.get("rpm"), config.get("tpm"), config.get("rpd")
-
-    if provider_type == "local":
-        return FastEmbedDenseProvider(model=model, dimension=dimension)
-
-    if provider_type == "gemini":
-        rate_limit = None
-        if all(v is not None for v in (rpm, tpm, rpd)):
-            from chatbot_plugin_sdk.rate_limit import SlidingWindowStrategy
-            rate_limit = SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd)
-        return GeminiDenseProvider(
-            api_key=config.get("api_key", ""),
-            model=model,
-            dimension=dimension,
-            rate_limit=rate_limit,
-        )
-
-    if provider_type == "endpoint":
-        rate_limit = None
-        if all(v is not None for v in (rpm, tpm, rpd)):
-            from chatbot_plugin_sdk.rate_limit import SlidingWindowStrategy
-            rate_limit = SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd)
-        return EndpointProvider(
-            url=config["endpoint_url"],
-            response_key="dense",
-            api_key=config.get("api_key"),
-            dimension=dimension,
-            rate_limit=rate_limit,
-        )
-
-    return None
-
-
-def build_sparse_provider(config: dict):
-    """Instantiate a sparse embedding provider from a config dict.
-
-    Config keys:
-        provider_type: ``"local"`` (fastembed) or ``"endpoint"``.
-        model: Model name (required for ``local``).
-        dimension: Vocabulary size (required for ``local``; ignored for ``endpoint``).
-        endpoint_url: Service URL (for ``endpoint``).
-        api_key: Bearer token (for ``endpoint``).
-        rpm / tpm / rpd: Rate-limit parameters (all three required to enable limiting).
-
-    Returns ``None`` when ``provider_type`` is empty or unrecognised.
-    """
-    provider_type = config.get("provider_type", "")
-    model = config.get("model", "")
-    dimension = config.get("dimension", 30522)
-    rpm, tpm, rpd = config.get("rpm"), config.get("tpm"), config.get("rpd")
-
-    if provider_type == "local":
-        return FastEmbedSparseProvider(model=model, dimension=dimension)
-
-    if provider_type == "endpoint":
-        rate_limit = None
-        if all(v is not None for v in (rpm, tpm, rpd)):
-            from chatbot_plugin_sdk.rate_limit import SlidingWindowStrategy
-            rate_limit = SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd)
-        return EndpointProvider(
-            url=config["endpoint_url"],
-            response_key="sparse",
-            api_key=config.get("api_key"),
-            dimension=None,
-            rate_limit=rate_limit,
-        )
-
-    return None

@@ -15,63 +15,65 @@ at runtime without needing dynamic ORM model classes.
 """
 from __future__ import annotations
 
+import re
+import uuid as _uuid_mod
 from typing import Any
-
 from collections.abc import Mapping
 
 from chatbot_plugin_sdk.exceptions import DatabaseError
 
-_ARTICLE_COLUMNS = frozenset({
-    "url", "title", "source", "public_article_id", "topic_id",
-})
+_SAFE_COLUMN_NAME = re.compile(r'^[a-z][a-z0-9_]*$')
+
+
+def _validate_column_name(name: str) -> None:
+    if not _SAFE_COLUMN_NAME.match(name):
+        raise DatabaseError(
+            f"Column name {name!r} is invalid — only lowercase letters, "
+            "digits, and underscores are allowed, starting with a letter."
+        )
+
+
+def _is_uuid_value(value: Any) -> bool:
+    """Return True if value is parseable as a UUID string."""
+    if value is None:
+        return False
+    try:
+        _uuid_mod.UUID(str(value))
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def _prepare_upsert_params(
     metadata: dict | None = None,
-    article_columns: dict[str, Any] | None = None,
+    articles_column_values: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict | None]:
-    """Prepare SQL column params from article_columns and JSONB blob from metadata.
+    """Validate column names and split into SQL column params + JSONB metadata blob.
 
-    ``article_columns`` is the sole source of SQL column values — keys are
-    validated against ``_ARTICLE_COLUMNS``.  ``metadata`` is opaque: it goes
-    entirely into the JSONB ``metadata`` column; the SDK never extracts keys
-    from it.
+    Column names in ``articles_column_values`` must match ``^[a-z][a-z0-9_]*$``
+    to prevent SQL injection.  Whether those columns exist in the target table
+    is the caller's responsibility.
     """
     col_params: dict[str, Any] = {}
-
-    if article_columns:
-        for key, value in article_columns.items():
-            if key not in _ARTICLE_COLUMNS:
-                raise DatabaseError(
-                    f"article_columns key {key!r} is not a known article column. "
-                    f"Known columns: {sorted(_ARTICLE_COLUMNS)}"
-                )
+    if articles_column_values:
+        for key, value in articles_column_values.items():
+            _validate_column_name(key)
             col_params[key] = value
-
     jsonb_metadata = dict(metadata) if metadata else None
-
     return col_params, jsonb_metadata
 
 
-_CHUNK_RESULT_KEYS = frozenset({
-    "chunk_id", "article_id", "chunk_index", "content", "distance",
-})
+_CHUNK_ROW_KEYS = frozenset({"chunk_id", "article_id", "chunk_index", "content", "distance"})
 
 
-def _extract_article_metadata(
-    row_mapping: Mapping,
-    columns: frozenset = _ARTICLE_COLUMNS,
-) -> dict[str, Any]:
-    """Extract article-level column values from a SQL result row mapping.
+def _extract_article_metadata(row_mapping: Mapping) -> dict[str, Any]:
+    """Return all article-level values from a SQL result row.
 
-    Returns a dict containing only the article columns (e.g. ``title``,
-    ``url``, ``source``, ``public_article_id``, ``topic_id``) that are
-    present in the row, filtering out chunk-level fields and ``None`` values.
+    Excludes the chunk-level fields (chunk_id, article_id, chunk_index, content,
+    distance).  All remaining columns — whatever the caller's migration defined —
+    are returned as-is.
     """
-    return {
-        k: v for k in columns
-        if k in row_mapping and row_mapping[k] is not None
-    }
+    return {k: v for k, v in row_mapping.items() if k not in _CHUNK_ROW_KEYS and v is not None}
 
 
 def _build_upsert_article_sql(
@@ -79,22 +81,26 @@ def _build_upsert_article_sql(
     articles_table: str,
     col_params: dict[str, Any],
 ) -> str:
-    """Build parameterized INSERT ... ON CONFLICT UPDATE for the articles table."""
+    """Build parameterized INSERT … ON CONFLICT (id) DO UPDATE for the articles table.
+
+    ``id`` (UUID derived from uuid5) is the PK and the conflict target.
+    All keys in ``col_params`` become INSERT columns.  UUID-valued entries
+    receive an explicit ``CAST(… AS UUID)``.  Column existence is the caller's
+    responsibility.
+    """
     cols = sorted(col_params.keys())
     insert_cols = ["id"] + cols + ["metadata"]
-    uuid_cols = {"id", "public_article_id", "topic_id"}
-    cast_placeholders = []
-    for c in insert_cols:
-        if c in uuid_cols:
+
+    cast_placeholders = ["CAST(:id AS UUID)"]
+    for c in cols:
+        if _is_uuid_value(col_params.get(c)):
             cast_placeholders.append(f"CAST(:{c} AS UUID)")
-        elif c == "metadata":
-            cast_placeholders.append("CAST(:metadata AS JSONB)")
         else:
             cast_placeholders.append(f":{c}")
+    cast_placeholders.append("CAST(:metadata AS JSONB)")
 
-    update_sets = ", ".join(
-        f"{c} = EXCLUDED.{c}" for c in cols if c != "url"
-    ) + ", metadata = EXCLUDED.metadata, updated_at = now()"
+    update_sets = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols)
+    update_sets += ", metadata = EXCLUDED.metadata, updated_at = now()"
 
     return (
         f"INSERT INTO {schema}.{articles_table} ({', '.join(insert_cols)})\n"
@@ -107,29 +113,25 @@ def _build_search_where(
     filters: dict[str, Any] | None,
     table_alias: str = "a",
 ) -> tuple[str, dict[str, Any]]:
-    """Build parameterized WHERE clause fragment from filters dict."""
+    """Build a parameterized WHERE clause fragment from a filters dict.
+
+    Column names are validated against ``_SAFE_COLUMN_NAME`` to prevent SQL
+    injection.  Whether those columns exist in the target table is the caller's
+    responsibility.  UUID-valued entries receive an explicit ``CAST(… AS UUID)``.
+    """
     if not filters:
         return "", {}
 
-    uuid_cols = {"public_article_id", "topic_id"}
     fragments = []
     params: dict[str, Any] = {}
 
     for col, value in filters.items():
-        if col not in _ARTICLE_COLUMNS:
-            raise DatabaseError(
-                f"filter key {col!r} is not a known article column. "
-                f"Known columns: {sorted(_ARTICLE_COLUMNS)}"
-            )
+        _validate_column_name(col)
         param_name = f"_f_{col}"
-        if col in uuid_cols:
-            fragments.append(
-                f"({table_alias}.{col} = CAST(:{param_name} AS UUID))"
-            )
+        if _is_uuid_value(value):
+            fragments.append(f"({table_alias}.{col} = CAST(:{param_name} AS UUID))")
         else:
-            fragments.append(
-                f"({table_alias}.{col} = :{param_name})"
-            )
+            fragments.append(f"({table_alias}.{col} = :{param_name})")
         params[param_name] = value
 
     where = " AND " + " AND ".join(fragments)
@@ -143,14 +145,13 @@ def _build_search_dense_sql(
     filters: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     where_frag, filter_params = _build_search_where(filters)
-    article_selects = ", ".join(f"a.{c}" for c in sorted(_ARTICLE_COLUMNS))
     sql = (
         f"SELECT\n"
-        f"    ac.id                    AS chunk_id,\n"
+        f"    ac.id          AS chunk_id,\n"
         f"    ac.article_id,\n"
         f"    ac.chunk_index,\n"
         f"    ac.content,\n"
-        f"    {article_selects},\n"
+        f"    a.*,\n"
         f"    ac.dense_vector <=> CAST(:query_vec AS vector) AS distance\n"
         f"FROM {schema}.{chunks_table} ac\n"
         f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"
@@ -169,14 +170,13 @@ def _build_search_sparse_sql(
     filters: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     where_frag, filter_params = _build_search_where(filters)
-    article_selects = ", ".join(f"a.{c}" for c in sorted(_ARTICLE_COLUMNS))
     sql = (
         f"SELECT\n"
-        f"    ac.id                    AS chunk_id,\n"
+        f"    ac.id          AS chunk_id,\n"
         f"    ac.article_id,\n"
         f"    ac.chunk_index,\n"
         f"    ac.content,\n"
-        f"    {article_selects},\n"
+        f"    a.*,\n"
         f"    (ac.sparse_vector <#> CAST(:query_vec AS sparsevec)) AS distance\n"
         f"FROM {schema}.{chunks_table} ac\n"
         f"JOIN {schema}.{articles_table} a ON ac.article_id = a.id\n"
@@ -187,6 +187,7 @@ def _build_search_sparse_sql(
     )
     return sql, filter_params
 
+
 _DDL_CREATE_EXTENSION = "CREATE EXTENSION IF NOT EXISTS vector"
 _DDL_CREATE_SCHEMA    = "CREATE SCHEMA IF NOT EXISTS {schema}"
 
@@ -196,17 +197,15 @@ _DDL_TABLE_EXISTS = (
     "WHERE table_schema = :s AND table_name = :t"
 )
 
+# Minimal SDK schema — callers add business columns via their own migration.
+# id = uuid5(NAMESPACE_URL, url), url is the dedup key used to derive it.
 _DDL_CREATE_ARTICLES = """\
 CREATE TABLE IF NOT EXISTS {schema}.{articles_table} (
-    id                UUID PRIMARY KEY,
-    url               TEXT NOT NULL UNIQUE,
-    title             TEXT,
-    source            TEXT,
-    public_article_id UUID,
-    topic_id          UUID,
-    metadata          JSONB,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    id         UUID PRIMARY KEY,
+    url        TEXT NOT NULL UNIQUE,
+    metadata   JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 )"""
 
 _DDL_CREATE_CHUNKS = """\
@@ -222,8 +221,7 @@ CREATE TABLE IF NOT EXISTS {schema}.{chunks_table} (
     CONSTRAINT uq_{chunks_table}_article_chunk_idx UNIQUE (article_id, chunk_index)
 )"""
 
-_DDL_IDX_URL    = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_url    ON {schema}.{articles_table}(url)"
-_DDL_IDX_SOURCE = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_source ON {schema}.{articles_table}(source)"
+_DDL_IDX_URL = "CREATE INDEX IF NOT EXISTS idx_{articles_table}_url ON {schema}.{articles_table}(url)"
 
 # ── DML (delete / insert chunks) ─────────────────────────────────────────────
 

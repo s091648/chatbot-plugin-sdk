@@ -44,6 +44,7 @@ from chatbot_plugin_sdk.providers.endpoint import EndpointProvider
 from chatbot_plugin_sdk.providers.local import LocalProvider
 from chatbot_plugin_sdk.providers.fastembed import FastEmbedDenseProvider, FastEmbedSparseProvider
 from chatbot_plugin_sdk.providers.gemini import GeminiDenseProvider
+from chatbot_plugin_sdk.providers.huggingface import HuggingFaceDenseProvider
 from chatbot_plugin_sdk.providers import build_dense_provider, build_sparse_provider
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.contracts.responses import SearchResponse, ChunkResult
@@ -77,6 +78,7 @@ __all__ = [
     "FastEmbedDenseProvider",
     "FastEmbedSparseProvider",
     "GeminiDenseProvider",
+    "HuggingFaceDenseProvider",
     "build_dense_provider",
     "build_sparse_provider",
     # Config

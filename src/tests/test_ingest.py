@@ -88,6 +88,27 @@ class TestIngestConfigure:
         )
         assert processor._ready is False
 
+    def test_custom_chunk_size_and_overlap_stored(self):
+        processor = IngestProcessor()
+        processor.configure(
+            backend=_mock_backend(),
+            dense=EndpointProvider(url="http://x", dimension=768),
+            chunk_size=1500,
+            chunk_overlap=150,
+        )
+        assert processor._chunk_size == 1500
+        assert processor._chunk_overlap == 150
+
+    def test_default_chunk_size_and_overlap(self):
+        from chatbot_plugin_sdk.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
+        processor = IngestProcessor()
+        processor.configure(
+            backend=_mock_backend(),
+            dense=EndpointProvider(url="http://x", dimension=768),
+        )
+        assert processor._chunk_size == DEFAULT_CHUNK_SIZE
+        assert processor._chunk_overlap == DEFAULT_CHUNK_OVERLAP
+
 
 # ── _ensure_ready() ─────────────────────────────────────────────────────────────
 

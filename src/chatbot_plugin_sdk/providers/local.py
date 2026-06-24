@@ -48,7 +48,7 @@ class LocalProvider:
             if asyncio.iscoroutinefunction(self._fn):
                 result = await self._fn(texts)
             else:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(None, self._fn, texts)
             logger.debug("local_embedding_done", extra={"vector_count": len(result)})
             return result

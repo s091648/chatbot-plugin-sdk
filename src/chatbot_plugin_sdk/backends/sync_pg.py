@@ -35,7 +35,6 @@ import logging
 
 from chatbot_plugin_sdk.backends.base import SearchRow
 from chatbot_plugin_sdk.backends._pg_ddl import (
-    _ARTICLE_COLUMNS,
     _build_search_dense_sql,
     _build_search_sparse_sql,
     _build_upsert_article_sql,
@@ -43,7 +42,6 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _DDL_CREATE_ARTICLES,
     _DDL_CREATE_EXTENSION,
     _DDL_CREATE_SCHEMA,
-    _DDL_IDX_SOURCE,
     _DDL_IDX_URL,
     _DDL_TABLE_EXISTS,
     _DML_DELETE_CHUNKS,
@@ -112,12 +110,12 @@ class SyncPgBackend:
         chunks: list[str],
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, self._upsert_sync,
-            article_id, metadata, chunks, dense_vectors, sparse_vectors, article_columns,
+            article_id, metadata, chunks, dense_vectors, sparse_vectors, articles_column_values,
         )
 
     async def search_dense(self, query_vec: list[float], top_k: int, filters: dict[str, Any] | None = None) -> list[SearchRow]:
@@ -151,7 +149,6 @@ class SyncPgBackend:
                     dense_col=dense_col, sparse_col=sparse_col,
                 )))
                 conn.execute(text(_DDL_IDX_URL.format(schema=schema, articles_table=at)))
-                conn.execute(text(_DDL_IDX_SOURCE.format(schema=schema, articles_table=at)))
                 logger.info(
                     "vector_tables_created",
                     extra={"schema": schema, "articles_table": at, "chunks_table": ct,
@@ -193,12 +190,12 @@ class SyncPgBackend:
         chunks: list[str],
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
     ) -> None:
         schema = self.schema
         at = self.articles_table
         ct = self.chunks_table
-        col_params, jsonb_metadata = _prepare_upsert_params(metadata, article_columns)
+        col_params, jsonb_metadata = _prepare_upsert_params(metadata, articles_column_values)
         try:
             with self._engine.begin() as conn:
                 sql = _build_upsert_article_sql(schema, at, col_params)
@@ -231,7 +228,7 @@ class SyncPgBackend:
         except DatabaseError:
             raise
         except Exception as exc:
-            raise DatabaseError(f"Upsert failed for article {article_id}: {exc}") from exc
+            raise DatabaseError(f"Upsert failed for article_id={article_id}: {exc}") from exc
 
     def _search_dense_sync(self, query_vec: list[float], top_k: int, filters: dict[str, Any] | None = None) -> list[SearchRow]:
         schema = self.schema
@@ -249,7 +246,7 @@ class SyncPgBackend:
                 chunk_index=r.chunk_index,
                 content=r.content,
                 distance=float(r.distance),
-                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
+                article_metadata=_extract_article_metadata(r._mapping),
             )
             for r in rows
         ]
@@ -273,7 +270,7 @@ class SyncPgBackend:
                 chunk_index=r.chunk_index,
                 content=r.content,
                 distance=float(r.distance),
-                article_metadata=_extract_article_metadata(r._mapping, _ARTICLE_COLUMNS),
+                article_metadata=_extract_article_metadata(r._mapping),
             )
             for r in rows
         ]

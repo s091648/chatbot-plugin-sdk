@@ -66,16 +66,20 @@ class DatabaseBackend(Protocol):
         chunks: list[str],
         dense_vectors: list[list[float]] | None,
         sparse_vectors: list[dict[str, float]] | None,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
     ) -> None:
         """Insert-or-replace article + chunks inside a single transaction.
 
+        ``url`` must be present in ``articles_column_values`` — it is used
+        by :class:`IngestProcessor` to derive a deterministic ``article_id``
+        via ``uuid.uuid5(NAMESPACE_URL, url)``.
+
         Args:
             metadata: Opaque JSONB blob — the SDK never interprets its keys.
-            article_columns: SQL column values for the articles table.
-                              Keys must be in the known article column set.
-                              This is the sole source of SQL column values;
-                              ``metadata`` keys are never promoted to columns.
+            articles_column_values: SQL column values for the articles table
+                                    (url, title, source, public_article_id,
+                                    topic_id).  Keys must be in the known
+                                    article column set.  ``url`` is required.
 
         On success: commits.  On any error: rolls back, raises :exc:`DatabaseError`.
         """

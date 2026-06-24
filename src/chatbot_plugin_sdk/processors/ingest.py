@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 from chatbot_plugin_sdk.backends.base import DatabaseBackend
-from chatbot_plugin_sdk.chunking import _chunk_text
+from chatbot_plugin_sdk.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, _chunk_text
 from chatbot_plugin_sdk.exceptions import DatabaseError, NotConfiguredError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
 
@@ -34,9 +34,8 @@ class IngestProcessor:
         )
         await processor.ingest(
             full_text="...",
-            article_id="550e8400-e29b-41d4-a716-446655440000",
-            article_columns={
-                "url": "https://example.com/article",
+            articles_column_values={
+                "url": "https://example.com/article",  # required — used as idempotent key
                 "title": "My Article",
             },
         )
@@ -54,14 +53,28 @@ class IngestProcessor:
         self._dense: DenseEmbeddingProvider | None = None
         self._sparse: SparseEmbeddingProvider | None = None
         self._ready: bool = False
+        self._embed_batch_size: int = 16
+        self._chunk_size: int = DEFAULT_CHUNK_SIZE
+        self._chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
 
     def configure(
         self,
         backend: DatabaseBackend,
         dense: DenseEmbeddingProvider | None = None,
         sparse: SparseEmbeddingProvider | None = None,
+        embed_batch_size: int = 16,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
-        """Bind backend + providers.  Pure sync, no I/O."""
+        """Bind backend + providers.  Pure sync, no I/O.
+
+        Args:
+            embed_batch_size: Max chunks sent to each provider's ``embed()`` per
+                              call. Smaller values reduce peak memory when using
+                              local ONNX models (e.g. SPLADE). Default: 16.
+            chunk_size: Maximum characters per chunk. Default: 500.
+            chunk_overlap: Overlap characters between consecutive chunks. Default: 50.
+        """
         if dense is None and sparse is None:
             raise NotConfiguredError(
                 "至少需要配置 dense 或 sparse 其中一種 embedding provider。"
@@ -69,6 +82,9 @@ class IngestProcessor:
         self._backend = backend
         self._dense = dense
         self._sparse = sparse
+        self._embed_batch_size = embed_batch_size
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
         self._ready = False
 
     async def _ensure_ready(self) -> None:
@@ -84,6 +100,20 @@ class IngestProcessor:
         self._ready = True
         logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
+    async def _embed_in_batches_dense(self, chunks: list[str]) -> list[list[float]]:
+        results: list[list[float]] = []
+        for i in range(0, len(chunks), self._embed_batch_size):
+            batch = chunks[i : i + self._embed_batch_size]
+            results.extend(await self._dense.embed(batch))  # type: ignore[union-attr]
+        return results
+
+    async def _embed_in_batches_sparse(self, chunks: list[str]) -> list[dict[str, float]]:
+        results: list[dict[str, float]] = []
+        for i in range(0, len(chunks), self._embed_batch_size):
+            batch = chunks[i : i + self._embed_batch_size]
+            results.extend(await self._sparse.embed(batch))  # type: ignore[union-attr]
+        return results
+
     @staticmethod
     def _normalize(text: str) -> str:
         text = unicodedata.normalize("NFC", text)
@@ -93,33 +123,37 @@ class IngestProcessor:
     async def ingest(
         self,
         full_text: str,
-        article_id: str | uuid.UUID,
-        article_columns: dict[str, Any] | None = None,
+        articles_column_values: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Full ingest pipeline: normalize → chunk → embed → upsert.
 
         Args:
             full_text: Raw article text (HTML-stripped or plain).
-            article_id: Unique identifier for this article (UUID or UUID string).
-                        Used as the primary key for idempotent upserts.
-            article_columns: SQL column values for the articles table (e.g.
-                              ``{"url": "...", "title": "...", "source": "..."}``).
-                              Keys must belong to the known article column set.
-                              This is the sole source of SQL column values; the
-                              ``metadata`` dict is never promoted to columns.
+            articles_column_values: SQL column values for the articles table.
+                                    Must include ``url`` — it is used to derive
+                                    a deterministic ``article_id`` via
+                                    ``uuid.uuid5(NAMESPACE_URL, url)`` for
+                                    idempotent upserts.  Any other keys become
+                                    INSERT columns; column existence is the
+                                    caller's responsibility.
             metadata: Opaque JSONB metadata — the SDK never interprets its keys.
         """
         await self._ensure_ready()
 
-        if isinstance(article_id, str):
-            article_id = uuid.UUID(article_id)
+        url = (articles_column_values or {}).get("url") or ""
+        if not url:
+            raise DatabaseError(
+                "'url' is required in articles_column_values — "
+                "it is used to derive the idempotent article_id via uuid5."
+            )
+        article_id = uuid.uuid5(uuid.NAMESPACE_URL, url)
 
         normalized = self._normalize(full_text)
         if not normalized:
             raise DatabaseError("Empty text after normalization.")
 
-        chunks = _chunk_text(normalized)
+        chunks = _chunk_text(normalized, chunk_size=self._chunk_size, overlap=self._chunk_overlap)
         if not chunks:
             raise DatabaseError("No chunks produced — input text may be too short.")
 
@@ -127,7 +161,7 @@ class IngestProcessor:
         sparse_vectors: list[dict[str, float]] | None = None
 
         if self._dense is not None:
-            dense_vectors = await self._dense.embed(chunks)
+            dense_vectors = await self._embed_in_batches_dense(chunks)
             if len(dense_vectors) != len(chunks):
                 raise DatabaseError(
                     f"Dense embedding returned {len(dense_vectors)} vectors "
@@ -135,18 +169,26 @@ class IngestProcessor:
                 )
 
         if self._sparse is not None:
-            sparse_vectors = await self._sparse.embed(chunks)
+            sparse_vectors = await self._embed_in_batches_sparse(chunks)
             if len(sparse_vectors) != len(chunks):
                 raise DatabaseError(
                     f"Sparse embedding returned {len(sparse_vectors)} vectors "
                     f"but {len(chunks)} chunks expected."
                 )
 
-        logger.debug("ingest_upserting", extra={"article_id": str(article_id), "chunk_count": len(chunks)})
-        await self._backend.upsert(article_id, metadata or {}, chunks, dense_vectors, sparse_vectors,
-            article_columns=article_columns,
+        logger.debug(
+            "ingest_upserting",
+            extra={"url": url, "chunk_count": len(chunks), "embed_batch_size": self._embed_batch_size},
+        )
+        await self._backend.upsert(
+            article_id,
+            metadata or {},
+            chunks,
+            dense_vectors,
+            sparse_vectors,
+            articles_column_values=articles_column_values,
         )
         logger.info(
             "ingest_complete",
-            extra={"article_id": str(article_id), "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
+            extra={"url": url, "chunk_count": len(chunks), "has_sparse": sparse_vectors is not None},
         )
