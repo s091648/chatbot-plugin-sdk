@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 import httpx
@@ -51,6 +52,8 @@ class EndpointProvider:
         dimension: int | None = None,
         timeout: float = 60.0,
         rate_limit: "RateLimitStrategy | None" = None,
+        retries: int = 3,
+        retry_delay: float = 2.0,
     ) -> None:
         if response_key == "dense" and dimension is None:
             raise ValueError("dimension is required when response_key='dense'")
@@ -59,6 +62,8 @@ class EndpointProvider:
         self._api_key = api_key
         self._timeout = timeout
         self._rate_limit = rate_limit
+        self._retries = retries
+        self._retry_delay = retry_delay
         self.dimension: int = dimension or 0  # sparse 時為 0（不使用）
 
     def _build_client(self) -> httpx.AsyncClient:
@@ -72,6 +77,9 @@ class EndpointProvider:
 
         Request body: ``{"texts": ["text1", ...]}``
         Expected response: ``{"dense": [[...], ...], "sparse": [{...}, ...]}``
+
+        Retries on connection errors (e.g. serverless cold start) with
+        exponential backoff. HTTP status errors are not retried.
         """
         # Estimate tokens: rough approximation (4 chars ≈ 1 token)
         _estimated_tokens = 0
@@ -83,22 +91,39 @@ class EndpointProvider:
             "embedding_request",
             extra={"url": self._url, "response_key": self._response_key, "text_count": len(texts)},
         )
-        async with self._build_client() as client:
-            try:
-                resp = await client.post("/embed", json={"texts": texts})
-                resp.raise_for_status()
-                data = resp.json()
-            except httpx.HTTPStatusError as exc:
-                logger.warning(
-                    "embedding_http_error",
-                    extra={"url": self._url, "status": exc.response.status_code},
-                )
-                raise EmbeddingError(
-                    f"Embedding endpoint returned {exc.response.status_code}: {exc.response.text}"
-                ) from exc
-            except Exception as exc:
-                logger.warning("embedding_request_failed", extra={"url": self._url, "error": str(exc)})
-                raise EmbeddingError(f"Embedding request failed: {exc}") from exc
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self._retries + 1):
+            async with self._build_client() as client:
+                try:
+                    resp = await client.post("/embed", json={"texts": texts})
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break  # success
+                except httpx.HTTPStatusError as exc:
+                    logger.warning(
+                        "embedding_http_error",
+                        extra={"url": self._url, "status": exc.response.status_code},
+                    )
+                    raise EmbeddingError(
+                        f"Embedding endpoint returned {exc.response.status_code}: {exc.response.text}"
+                    ) from exc
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_exc = exc
+                    if attempt < self._retries:
+                        wait = self._retry_delay * (2 ** (attempt - 1))
+                        logger.info(
+                            "embedding_retry",
+                            extra={"url": self._url, "attempt": attempt, "retry_after": wait, "error": str(exc)},
+                        )
+                        await asyncio.sleep(wait)
+                except Exception as exc:
+                    logger.warning("embedding_request_failed", extra={"url": self._url, "error": str(exc)})
+                    raise EmbeddingError(f"Embedding request failed: {exc}") from exc
+        else:
+            raise EmbeddingError(
+                f"Embedding request failed after {self._retries} attempts: {last_exc}"
+            ) from last_exc
 
         result = data.get(self._response_key)
         if not result:
