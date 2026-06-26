@@ -118,6 +118,10 @@ def _build_search_where(
     Column names are validated against ``_SAFE_COLUMN_NAME`` to prevent SQL
     injection.  Whether those columns exist in the target table is the caller's
     responsibility.  UUID-valued entries receive an explicit ``CAST(… AS UUID)``.
+
+    List values are expanded into ``IN`` clauses (e.g. ``{"id": ["a","b"]}`` →
+    ``a.id IN (CAST(:_f_id_0 AS UUID), CAST(:_f_id_1 AS UUID))``).  Scalar
+    values use equality as before.
     """
     if not filters:
         return "", {}
@@ -127,12 +131,28 @@ def _build_search_where(
 
     for col, value in filters.items():
         _validate_column_name(col)
-        param_name = f"_f_{col}"
-        if _is_uuid_value(value):
-            fragments.append(f"({table_alias}.{col} = CAST(:{param_name} AS UUID))")
+        if isinstance(value, list):
+            if not value:
+                continue
+            placeholders = []
+            for i, item in enumerate(value):
+                param_name = f"_f_{col}_{i}"
+                if _is_uuid_value(item):
+                    placeholders.append(f"CAST(:{param_name} AS UUID)")
+                else:
+                    placeholders.append(f":{param_name}")
+                params[param_name] = item
+            fragments.append(f"({table_alias}.{col} IN ({', '.join(placeholders)}))")
         else:
-            fragments.append(f"({table_alias}.{col} = :{param_name})")
-        params[param_name] = value
+            param_name = f"_f_{col}"
+            if _is_uuid_value(value):
+                fragments.append(f"({table_alias}.{col} = CAST(:{param_name} AS UUID))")
+            else:
+                fragments.append(f"({table_alias}.{col} = :{param_name})")
+            params[param_name] = value
+
+    if not fragments:
+        return "", {}
 
     where = " AND " + " AND ".join(fragments)
     return where, params
