@@ -108,7 +108,7 @@ class EndpointProvider:
                     raise EmbeddingError(
                         f"Embedding endpoint returned {exc.response.status_code}: {exc.response.text}"
                     ) from exc
-                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                     last_exc = exc
                     if attempt < self._retries:
                         wait = self._retry_delay * (2 ** (attempt - 1))
