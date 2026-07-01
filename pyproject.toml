@@ -1,6 +1,6 @@
 [project]
 name = "chatbot-plugin-sdk"
-version = "0.14.0"
+version = "0.15.0"
 description = "Python SDK for the vector storage toolbox — RAG article ingestion and querying"
 requires-python = ">=3.11"
 dependencies = [
