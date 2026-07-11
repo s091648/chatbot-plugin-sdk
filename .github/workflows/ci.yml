@@ -1,4 +1,4 @@
-name: CI & Publish
+name: Bump Version on Tag
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build-and-publish:
+  bump-version:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -38,11 +38,3 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
           git tag -f "$TAG_NAME"
           git push origin "refs/tags/$TAG_NAME" --force
-
-      - name: Build
-        run: uv build
-
-      - name: Publish to PyPI
-        run: uv publish
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
