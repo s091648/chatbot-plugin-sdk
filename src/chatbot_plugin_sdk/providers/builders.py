@@ -100,6 +100,7 @@ def build_sparse_provider(config: dict):
             response_key="sparse",
             api_key=config.get("api_key"),
             dimension=dimension,
+            timeout=config.get("timeout", 60.0),
             rate_limit=rate_limit,
         )
 
