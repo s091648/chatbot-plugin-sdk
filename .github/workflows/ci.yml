@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
 
     steps:
       - name: Checkout
@@ -31,6 +32,12 @@ jobs:
           git add pyproject.toml
           git commit -m "chore: bump version to $VERSION [skip ci]"
           git push origin HEAD:refs/heads/main
+
+      - name: Move tag to version bump commit
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          git tag -f "$TAG_NAME"
+          git push origin "refs/tags/$TAG_NAME" --force
 
       - name: Build
         run: uv build

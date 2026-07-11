@@ -5,6 +5,8 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
+
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
 
@@ -35,6 +37,19 @@ def _is_quota_error(exc: Exception) -> bool:
     return "429" in str(exc) or getattr(exc, "status_code", None) == 429
 
 
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """True when the 429 is Google's daily (RPD) quota, not a per-minute one.
+
+    Google's structured error body (embedded in ``str(exc)`` for
+    ``google.genai.errors.APIError``) reports a ``QuotaFailure`` violation
+    whose ``quotaId`` contains ``PerDay`` for daily-cap errors. This is more
+    reliable than guessing from ``retryDelay`` size — a daily quota error can
+    still carry a short suggested delay, which would otherwise be retried.
+    """
+    msg = str(exc)
+    return "RESOURCE_EXHAUSTED" in msg and "PerDay" in msg
+
+
 class GeminiDenseProvider:
     """Dense embedding provider backed by Google Gemini (google-genai).
 
@@ -43,8 +58,10 @@ class GeminiDenseProvider:
 
     When Google returns HTTP 429 the provider sleeps for the suggested
     ``retryDelay`` (parsed from the error response) and retries transparently.
-    Delays longer than 5 minutes are not retried — they indicate a daily quota
-    exhaustion that won't recover within the current pipeline run.
+    A daily (RPD) quota violation — detected from the ``QuotaFailure`` detail
+    in the error body, not the delay's length — raises ``RateLimitExhausted``
+    immediately instead of retrying, since it won't recover within the run.
+    Delays longer than 5 minutes are treated the same way as a fallback.
 
     Args:
         api_key: Gemini API key.
@@ -91,6 +108,15 @@ class GeminiDenseProvider:
             except Exception as exc:
                 if not _is_quota_error(exc):
                     raise
+
+                if _is_daily_quota_error(exc):
+                    logger.error(
+                        "gemini_daily_quota_exhausted",
+                        extra={"model": self._model},
+                    )
+                    raise RateLimitExhausted(
+                        f"Daily quota exceeded for {self._model}"
+                    ) from exc
 
                 delay = _parse_retry_delay(exc)
                 if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
