@@ -1,16 +1,36 @@
-name: Bump Version on Tag
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
+  # -----------------------------------------------------------------------
+  # Bump pyproject.toml to the pushed tag's version, commit to main, then
+  # force-move the tag onto that commit. The force-move re-triggers this
+  # workflow on `push: tags`; the `[skip ci]` guard below stops that second
+  # run from bumping again (infinite loop).
+  #
+  # Only runs for an actual tag push — workflow_dispatch (manual docs
+  # rebuild, no tag involved) skips straight to deploy-docs.
+  # -----------------------------------------------------------------------
   bump-version:
+    name: Bump Version
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
 
     steps:
       - name: Checkout
@@ -38,3 +58,60 @@ jobs:
           TAG_NAME=${GITHUB_REF#refs/tags/}
           git tag -f "$TAG_NAME"
           git push origin "refs/tags/$TAG_NAME" --force
+
+  # -----------------------------------------------------------------------
+  # Build the MkDocs site from main — by the time this runs, bump-version
+  # (if it ran) has already pushed the version bump there, so this always
+  # reflects the tagged release. workflow_dispatch builds whatever is
+  # currently on main, with no version bump involved.
+  # -----------------------------------------------------------------------
+  deploy-docs:
+    name: Build Docs
+    needs: bump-version
+    if: |
+      always() &&
+      (needs.bump-version.result == 'success' || needs.bump-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install docs dependencies
+        run: uv sync --group docs
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build MkDocs
+        run: uv run mkdocs build
+        env:
+          SITE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publish-docs:
+    name: Publish Docs to GitHub Pages
+    needs: deploy-docs
+    if: needs.deploy-docs.result == 'success'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
