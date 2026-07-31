@@ -52,6 +52,7 @@ from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbedding
 from chatbot_plugin_sdk.exceptions import (
     ToolboxError,
     NotConfiguredError,
+    ExternalDependencyError,
     DatabaseError,
     EmbeddingError,
     ChunkingError,
@@ -95,6 +96,7 @@ __all__ = [
     # Exceptions
     "ToolboxError",
     "NotConfiguredError",
+    "ExternalDependencyError",
     "DatabaseError",
     "EmbeddingError",
     "ChunkingError",

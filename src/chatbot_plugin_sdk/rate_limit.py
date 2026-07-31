@@ -14,11 +14,17 @@ import time
 from collections import deque
 from typing import Protocol, runtime_checkable
 
+from chatbot_plugin_sdk.exceptions import ExternalDependencyError
 
-class RateLimitExhausted(Exception):
-    """Raised when the daily request cap (rpd) is reached.
 
-    Callers may catch this to fall back to a different provider or abort.
+class RateLimitExhausted(ExternalDependencyError):
+    """Raised when a provider's request cap (local rpd, or the upstream
+    API's own quota) is reached and won't recover within this run.
+
+    A leaf of :class:`ExternalDependencyError` — callers who only care that
+    "something upstream failed" can catch the parent; callers who want to
+    react specifically to rate limiting (back off, rotate to a different
+    provider/key, or abort this run) should catch this class by name.
     """
 
 

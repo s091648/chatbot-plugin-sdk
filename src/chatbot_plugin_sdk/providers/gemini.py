@@ -5,6 +5,7 @@ import logging
 import re
 from typing import TYPE_CHECKING
 
+from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
 
 if TYPE_CHECKING:
@@ -61,7 +62,13 @@ class GeminiDenseProvider:
     A daily (RPD) quota violation — detected from the ``QuotaFailure`` detail
     in the error body, not the delay's length — raises ``RateLimitExhausted``
     immediately instead of retrying, since it won't recover within the run.
-    Delays longer than 5 minutes are treated the same way as a fallback.
+    A 429 with no parseable ``retryDelay`` (Google's error body doesn't
+    always include one), a delay longer than 5 minutes, or repeated 429s past
+    ``max_retries`` are all treated the same way — raised as
+    ``RateLimitExhausted`` rather than the raw ``google.genai`` exception, so
+    every quota-exhaustion path is catchable by callers as one type. Any
+    other failure (network error, malformed response, auth failure) is
+    raised as ``EmbeddingError``, never the raw SDK/HTTP exception.
 
     Args:
         api_key: Gemini API key.
@@ -107,7 +114,9 @@ class GeminiDenseProvider:
                 return await loop.run_in_executor(None, self._embed_sync, texts)
             except Exception as exc:
                 if not _is_quota_error(exc):
-                    raise
+                    raise EmbeddingError(
+                        f"Gemini embedding request failed: {exc}"
+                    ) from exc
 
                 if _is_daily_quota_error(exc):
                     logger.error(
@@ -124,14 +133,18 @@ class GeminiDenseProvider:
                         "gemini_daily_quota_exhausted",
                         extra={"delay": delay, "model": self._model},
                     )
-                    raise
+                    raise RateLimitExhausted(
+                        f"Quota exceeded for {self._model} with no retryable delay"
+                    ) from exc
 
                 if attempt >= self._max_retries - 1:
                     logger.error(
                         "gemini_rate_limit_max_retries_exceeded",
                         extra={"attempts": self._max_retries, "model": self._model},
                     )
-                    raise
+                    raise RateLimitExhausted(
+                        f"Quota exceeded for {self._model} after {self._max_retries} retries"
+                    ) from exc
 
                 logger.warning(
                     "gemini_rate_limited_retrying",
