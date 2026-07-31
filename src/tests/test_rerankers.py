@@ -13,7 +13,8 @@ from chatbot_plugin_sdk.rerankers.fastembed import FastEmbedReranker
 def _row(chunk_id: str, content: str = "text") -> SearchRow:
     return SearchRow(
         chunk_id=chunk_id, article_id="a1", chunk_index=0,
-        content=content, title="T", url="https://x.com", distance=0.1,
+        content=content, distance=0.1,
+        article_metadata={"title": "T", "url": "https://x.com"},
     )
 
 

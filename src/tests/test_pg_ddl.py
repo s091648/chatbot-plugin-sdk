@@ -2,7 +2,6 @@
 import pytest
 
 from chatbot_plugin_sdk.backends._pg_ddl import (
-    _ARTICLE_COLUMNS,
     _prepare_upsert_params,
     _extract_article_metadata,
     _build_search_where,
@@ -11,15 +10,6 @@ from chatbot_plugin_sdk.backends._pg_ddl import (
     _build_search_sparse_sql,
 )
 from chatbot_plugin_sdk.exceptions import DatabaseError
-
-
-class TestArticleColumns:
-    def test_known_columns(self):
-        assert "topic_id" in _ARTICLE_COLUMNS
-        assert "url" in _ARTICLE_COLUMNS
-        assert "title" in _ARTICLE_COLUMNS
-        assert "source" in _ARTICLE_COLUMNS
-        assert "public_article_id" in _ARTICLE_COLUMNS
 
 
 class TestPrepareUpsertParams:
@@ -33,16 +23,18 @@ class TestPrepareUpsertParams:
     def test_article_columns_provide_sql_values(self):
         metadata = {"url": "https://x.com"}
         col_params, jsonb = _prepare_upsert_params(
-            metadata, article_columns={"topic_id": "uuid-123"}
+            metadata, articles_column_values={"topic_id": "uuid-123"}
         )
         assert col_params["topic_id"] == "uuid-123"
         assert jsonb == {"url": "https://x.com"}
 
-    def test_article_columns_invalid_key_raises(self):
-        with pytest.raises(DatabaseError, match="not a known article column"):
+    def test_invalid_column_name_raises(self):
+        """Column names are validated against a naming pattern (SQL-injection guard),
+        not against a fixed allowlist — any table's own migration may add columns."""
+        with pytest.raises(DatabaseError, match="invalid"):
             _prepare_upsert_params(
                 {"url": "https://x.com"},
-                article_columns={"nonexistent_col": "val"},
+                articles_column_values={"Bad-Column": "val"},
             )
 
     def test_no_jsonb_when_empty(self):
@@ -52,7 +44,7 @@ class TestPrepareUpsertParams:
 
     def test_metadata_none(self):
         col_params, jsonb = _prepare_upsert_params(
-            metadata=None, article_columns={"url": "https://x.com"}
+            metadata=None, articles_column_values={"url": "https://x.com"}
         )
         assert col_params == {"url": "https://x.com"}
         assert jsonb is None
@@ -72,7 +64,7 @@ class TestExtractArticleMetadata:
             "public_article_id": "uuid-123",
             "topic_id": None,
         }
-        result = _extract_article_metadata(row, _ARTICLE_COLUMNS)
+        result = _extract_article_metadata(row)
         assert result == {
             "title": "My Article",
             "url": "https://example.com",
@@ -85,7 +77,7 @@ class TestExtractArticleMetadata:
 
     def test_empty_when_no_article_columns_present(self):
         row = {"chunk_id": "c1", "article_id": "a1", "content": "text", "distance": 0.2}
-        result = _extract_article_metadata(row, _ARTICLE_COLUMNS)
+        result = _extract_article_metadata(row)
         assert result == {}
 
 
@@ -106,19 +98,19 @@ class TestBuildSearchWhere:
         assert params["_f_source"] == "wiki"
 
     def test_uuid_filter(self):
-        frag, params = _build_search_where({"topic_id": "uuid-xxx"})
+        frag, params = _build_search_where({"topic_id": "12345678-1234-5678-1234-567812345678"})
         assert "CAST(:_f_topic_id AS UUID)" in frag
-        assert params["_f_topic_id"] == "uuid-xxx"
+        assert params["_f_topic_id"] == "12345678-1234-5678-1234-567812345678"
 
     def test_multiple_filters_are_anded(self):
-        frag, params = _build_search_where({"source": "wiki", "topic_id": "uuid-xxx"})
+        frag, params = _build_search_where({"source": "wiki", "topic_id": "12345678-1234-5678-1234-567812345678"})
         assert "AND" in frag
         assert "_f_source" in params
         assert "_f_topic_id" in params
 
     def test_invalid_filter_key_raises(self):
-        with pytest.raises(DatabaseError, match="not a known article column"):
-            _build_search_where({"nonexistent": "val"})
+        with pytest.raises(DatabaseError, match="invalid"):
+            _build_search_where({"Bad-Key": "val"})
 
 
 class TestBuildUpsertArticleSql:
@@ -131,7 +123,7 @@ class TestBuildUpsertArticleSql:
         assert ":title" in sql
 
     def test_includes_topic_id_when_present(self):
-        col_params = {"url": "https://x.com", "topic_id": "uuid-xxx"}
+        col_params = {"url": "https://x.com", "topic_id": "12345678-1234-5678-1234-567812345678"}
         sql = _build_upsert_article_sql("vectors", "articles", col_params)
         assert ":topic_id" in sql
         assert "CAST(:topic_id AS UUID)" in sql
@@ -143,10 +135,11 @@ class TestBuildSearchDenseSql:
         assert "WHERE ac.dense_vector IS NOT NULL" in sql
         assert params == {}
 
-    def test_includes_all_article_columns_in_select(self):
+    def test_selects_all_article_columns_via_star(self):
+        """No fixed column allowlist — a.* picks up whatever the caller's own
+        migration added to the articles table."""
         sql, _ = _build_search_dense_sql("vectors", "articles", "chunks")
-        for col in _ARTICLE_COLUMNS:
-            assert f"a.{col}" in sql
+        assert "a.*" in sql
 
     def test_with_filters(self):
         sql, params = _build_search_dense_sql(
@@ -164,15 +157,14 @@ class TestBuildSearchSparseSql:
         assert "sparse_vector <#>" in sql
         assert params == {}
 
-    def test_includes_all_article_columns_in_select(self):
+    def test_selects_all_article_columns_via_star(self):
         sql, _ = _build_search_sparse_sql("vectors", "articles", "chunks")
-        for col in _ARTICLE_COLUMNS:
-            assert f"a.{col}" in sql
+        assert "a.*" in sql
 
     def test_with_filters(self):
         sql, params = _build_search_sparse_sql(
             "vectors", "articles", "chunks",
-            filters={"topic_id": "uuid-xxx"},
+            filters={"topic_id": "12345678-1234-5678-1234-567812345678"},
         )
         assert "CAST(:_f_topic_id AS UUID)" in sql
-        assert params["_f_topic_id"] == "uuid-xxx"
+        assert params["_f_topic_id"] == "12345678-1234-5678-1234-567812345678"

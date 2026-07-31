@@ -145,52 +145,48 @@ class TestIngestPipeline:
     async def test_raises_without_configure(self):
         processor = IngestProcessor()
         with pytest.raises(NotConfiguredError):
-            await processor.ingest("hello", article_id="550e8400-e29b-41d4-a716-446655440000")
+            await processor.ingest("hello")
 
     @pytest.mark.asyncio
     async def test_raises_on_empty_text(self):
         processor, _ = _configured_processor()
         with pytest.raises(DatabaseError):
-            await processor.ingest("   ", article_id="550e8400-e29b-41d4-a716-446655440000")
+            await processor.ingest(
+                "   ", articles_column_values={"url": "https://example.com/article"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_raises_when_url_missing(self):
+        processor, _ = _configured_processor()
+        with pytest.raises(DatabaseError, match="url"):
+            await processor.ingest("Hello world. " * 100)
 
     @pytest.mark.asyncio
     async def test_calls_backend_upsert(self):
         processor, backend = _configured_processor()
-        article_id = "550e8400-e29b-41d4-a716-446655440000"
+        url = "https://example.com/article"
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                article_id=article_id,
-                article_columns={"url": "https://example.com/article", "title": "Test"},
+                articles_column_values={"url": url, "title": "Test"},
             )
         mock_embed.assert_called_once()
         backend.upsert.assert_called_once()
         call_args = backend.upsert.call_args.args
-        assert call_args[0] == uuid.UUID(article_id)
+        assert call_args[0] == uuid.uuid5(uuid.NAMESPACE_URL, url)
         assert call_args[4] is None  # no sparse provider
 
     @pytest.mark.asyncio
-    async def test_article_id_passed_through_to_backend(self):
+    async def test_article_id_derived_deterministically_from_url(self):
         processor, backend = _configured_processor()
-        article_id = uuid.uuid4()
+        url = "https://example.com/deterministic-article"
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
-            await processor.ingest("text " * 200, article_id=article_id)
+            await processor.ingest("text " * 200, articles_column_values={"url": url})
 
         actual_id = backend.upsert.call_args.args[0]
-        assert actual_id == article_id
-
-    @pytest.mark.asyncio
-    async def test_article_id_string_converted_to_uuid(self):
-        processor, backend = _configured_processor()
-        article_id_str = "550e8400-e29b-41d4-a716-446655440000"
-        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
-            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
-            await processor.ingest("text " * 200, article_id=article_id_str)
-
-        actual_id = backend.upsert.call_args.args[0]
-        assert actual_id == uuid.UUID(article_id_str)
+        assert actual_id == uuid.uuid5(uuid.NAMESPACE_URL, url)
 
     @pytest.mark.asyncio
     async def test_raises_on_dense_vector_count_mismatch(self):
@@ -200,7 +196,7 @@ class TestIngestPipeline:
             with pytest.raises(DatabaseError, match="Dense embedding returned"):
                 await processor.ingest(
                     "Hello world. " * 100,
-                    article_id="550e8400-e29b-41d4-a716-446655440000",
+                    articles_column_values={"url": "https://example.com/article"},
                 )
 
     @pytest.mark.asyncio
@@ -211,7 +207,7 @@ class TestIngestPipeline:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                article_id="550e8400-e29b-41d4-a716-446655440000",
+                articles_column_values={"url": "https://example.com/a"},
                 metadata={"url": "https://example.com/a", "title": "Test"},
             )
 
@@ -222,32 +218,19 @@ class TestIngestPipeline:
         assert metadata_arg["title"] == "Test"
 
 
-# ── ingest(article_columns=...) ──────────────────────────────────────────────────────
+# ── ingest(articles_column_values=...) ────────────────────────────────────────────────
 
 class TestIngestArticleColumns:
     @pytest.mark.asyncio
     async def test_passes_article_columns_to_backend(self):
         processor, backend = _configured_processor()
+        columns = {"url": "https://example.com/a", "title": "Test", "topic_id": "some-uuid"}
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
             await processor.ingest(
                 "Hello world. " * 100,
-                article_id="550e8400-e29b-41d4-a716-446655440000",
-                article_columns={"url": "https://example.com/a", "title": "Test", "topic_id": "some-uuid"},
+                articles_column_values=columns,
             )
 
         call_kwargs = backend.upsert.call_args.kwargs
-        assert call_kwargs.get("article_columns") == {"url": "https://example.com/a", "title": "Test", "topic_id": "some-uuid"}
-
-    @pytest.mark.asyncio
-    async def test_article_columns_default_none(self):
-        processor, backend = _configured_processor()
-        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
-            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
-            await processor.ingest(
-                "Hello world. " * 100,
-                article_id="550e8400-e29b-41d4-a716-446655440000",
-            )
-
-        call_kwargs = backend.upsert.call_args.kwargs
-        assert call_kwargs.get("article_columns") is None
+        assert call_kwargs.get("articles_column_values") == columns
