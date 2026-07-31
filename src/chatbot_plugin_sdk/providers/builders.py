@@ -17,6 +17,9 @@ def build_dense_provider(config: dict):
         api_key: API key / token (for ``gemini`` and ``huggingface``; Bearer token for ``endpoint``).
         endpoint_url: Service URL (for ``endpoint``).
         rpm / tpm / rpd: Rate-limit parameters (all three required to enable limiting).
+        split_batch_on_tpm: ``gemini`` only. When True, a per-minute TOKEN
+            quota (TPM) 429 splits the batch in half and retries each half
+            instead of retrying the full batch unchanged. Default False.
 
     Returns ``None`` when ``provider_type`` is empty or unrecognised.
     """
@@ -38,6 +41,7 @@ def build_dense_provider(config: dict):
             model=model,
             dimension=dimension,
             rate_limit=rate_limit,
+            split_batch_on_tpm=config.get("split_batch_on_tpm", False),
         )
 
     if provider_type == "huggingface":

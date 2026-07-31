@@ -51,6 +51,22 @@ def _is_daily_quota_error(exc: Exception) -> bool:
     return "RESOURCE_EXHAUSTED" in msg and "PerDay" in msg
 
 
+def _is_token_quota_error(exc: Exception) -> bool:
+    """True when the 429 is a per-minute TOKEN quota (TPM), not RPD or RPM.
+
+    Google's ``QuotaFailure.violations[].quotaId`` names the dimension that
+    was exceeded — token-based quotas contain ``Token`` (e.g.
+    ``GenerateContentInputTokensPerModelPerMinute-FreeTier``), while
+    request-count quotas (RPM) contain ``Requests`` instead. Checked after
+    :func:`_is_daily_quota_error` so a daily token cap (which also contains
+    ``Token``) is still classified as RPD, not TPM.
+    """
+    msg = str(exc)
+    if "RESOURCE_EXHAUSTED" not in msg or "PerDay" in msg:
+        return False
+    return "token" in msg.lower()
+
+
 class GeminiDenseProvider:
     """Dense embedding provider backed by Google Gemini (google-genai).
 
@@ -62,6 +78,22 @@ class GeminiDenseProvider:
     A daily (RPD) quota violation — detected from the ``QuotaFailure`` detail
     in the error body, not the delay's length — raises ``RateLimitExhausted``
     immediately instead of retrying, since it won't recover within the run.
+    The instance also latches: once a daily quota 429 is seen, every later
+    ``embed()`` call in the same process raises ``RateLimitExhausted``
+    immediately without making an API call, since Google's daily cap is
+    tracked server-side across the whole account/day — it will not clear
+    before this process exits. There is deliberately no cross-process
+    persistence (Postgres/Redis) for this: the account-wide reset time isn't
+    reliably known, so a stored "still exhausted" flag would have no correct
+    time to flip back off. Re-checking once per process (this latch) and
+    trusting the next process's first real call to re-probe Google avoids
+    that problem entirely.
+    A per-minute TOKEN quota (TPM) violation, also detected from the
+    ``QuotaFailure`` detail, is retried the same way by default; passing
+    ``split_batch_on_tpm=True`` makes it instead wait out the suggested delay
+    *and* halve the batch before retrying each half — waiting alone doesn't
+    help when the batch itself is the problem, and halving alone doesn't help
+    if requests are still fired back-to-back, so the two are combined.
     A 429 with no parseable ``retryDelay`` (Google's error body doesn't
     always include one), a delay longer than 5 minutes, or repeated 429s past
     ``max_retries`` are all treated the same way — raised as
@@ -78,6 +110,14 @@ class GeminiDenseProvider:
                     Construct it in the caller; use ``build_dense_provider`` for the
                     standard ``rpm / tpm / rpd`` → strategy conversion.
         max_retries: How many times to retry on 429 before giving up (default: 5).
+        split_batch_on_tpm: When a 429 is identified as a per-minute TOKEN
+                    quota (TPM) and the batch has more than one text, wait out
+                    the suggested delay then split the batch in half and retry
+                    each half independently (recursing further if still too
+                    large) instead of retrying the full batch unchanged.
+                    Default ``False`` — opt in only if TPM 429s are observed;
+                    the default RPM-style wait-and-retry already recovers once
+                    the sliding window resets.
     """
 
     def __init__(
@@ -87,6 +127,7 @@ class GeminiDenseProvider:
         dimension: int = 768,
         rate_limit: "RateLimitStrategy | None" = None,
         max_retries: int = 5,
+        split_batch_on_tpm: bool = False,
     ) -> None:
         from google import genai
         self._client = genai.Client(api_key=api_key)
@@ -94,6 +135,8 @@ class GeminiDenseProvider:
         self.dimension: int = dimension
         self._rate_limit = rate_limit
         self._max_retries = max_retries
+        self._split_batch_on_tpm = split_batch_on_tpm
+        self._daily_exhausted = False
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         response = self._client.models.embed_content(
@@ -104,6 +147,15 @@ class GeminiDenseProvider:
         return [list(e.values) for e in response.embeddings]
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        if self._daily_exhausted:
+            logger.warning(
+                "gemini_daily_quota_skip",
+                extra={"model": self._model},
+            )
+            raise RateLimitExhausted(
+                f"Daily quota already exhausted for {self._model} this run"
+            )
+
         if self._rate_limit is not None:
             estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
             await self._rate_limit.acquire(estimated_tokens)
@@ -119,6 +171,7 @@ class GeminiDenseProvider:
                     ) from exc
 
                 if _is_daily_quota_error(exc):
+                    self._daily_exhausted = True
                     logger.error(
                         "gemini_daily_quota_exhausted",
                         extra={"model": self._model},
@@ -128,9 +181,26 @@ class GeminiDenseProvider:
                     ) from exc
 
                 delay = _parse_retry_delay(exc)
+
+                if (
+                    self._split_batch_on_tpm
+                    and len(texts) > 1
+                    and _is_token_quota_error(exc)
+                ):
+                    logger.warning(
+                        "gemini_tpm_quota_split",
+                        extra={"batch_size": len(texts), "delay": delay, "model": self._model},
+                    )
+                    if delay is not None and delay <= _MAX_RETRYABLE_DELAY_SECS:
+                        await asyncio.sleep(delay)
+                    mid = len(texts) // 2
+                    left = await self.embed(texts[:mid])
+                    right = await self.embed(texts[mid:])
+                    return left + right
+
                 if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
                     logger.error(
-                        "gemini_daily_quota_exhausted",
+                        "gemini_quota_no_retryable_delay",
                         extra={"delay": delay, "model": self._model},
                     )
                     raise RateLimitExhausted(
