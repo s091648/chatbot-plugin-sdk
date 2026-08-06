@@ -67,6 +67,28 @@ def _is_token_quota_error(exc: Exception) -> bool:
     return "token" in msg.lower()
 
 
+def _quota_dimension(exc: Exception) -> str:
+    """Names which Google quota dimension a 429 violated, for logging.
+
+    Built on the same ``QuotaFailure.violations[].quotaId`` substring checks
+    as :func:`_is_daily_quota_error`/:func:`_is_token_quota_error` (kept as
+    separate booleans there since each gates different retry behavior) —
+    this just labels the result so log lines can show *which* of RPD/TPM/RPM
+    was hit instead of only whether a retry delay was parseable. Returns
+    ``"unknown"`` for a 429 whose error body doesn't carry a recognizable
+    quotaId (e.g. Google changes the format, or a non-``RESOURCE_EXHAUSTED``
+    429 reaches here via the plain ``"429"`` substring check in
+    :func:`_is_quota_error`).
+    """
+    if _is_daily_quota_error(exc):
+        return "rpd"
+    if _is_token_quota_error(exc):
+        return "tpm"
+    if "RESOURCE_EXHAUSTED" in str(exc):
+        return "rpm"
+    return "unknown"
+
+
 class GeminiDenseProvider:
     """Dense embedding provider backed by Google Gemini (google-genai).
 
@@ -174,13 +196,14 @@ class GeminiDenseProvider:
                     self._daily_exhausted = True
                     logger.error(
                         "gemini_daily_quota_exhausted",
-                        extra={"model": self._model},
+                        extra={"model": self._model, "quota_dimension": "rpd"},
                     )
                     raise RateLimitExhausted(
                         f"Daily quota exceeded for {self._model}"
                     ) from exc
 
                 delay = _parse_retry_delay(exc)
+                dimension = _quota_dimension(exc)
 
                 if (
                     self._split_batch_on_tpm
@@ -189,7 +212,12 @@ class GeminiDenseProvider:
                 ):
                     logger.warning(
                         "gemini_tpm_quota_split",
-                        extra={"batch_size": len(texts), "delay": delay, "model": self._model},
+                        extra={
+                            "batch_size": len(texts),
+                            "delay": delay,
+                            "model": self._model,
+                            "quota_dimension": dimension,
+                        },
                     )
                     if delay is not None and delay <= _MAX_RETRYABLE_DELAY_SECS:
                         await asyncio.sleep(delay)
@@ -201,16 +229,21 @@ class GeminiDenseProvider:
                 if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
                     logger.error(
                         "gemini_quota_no_retryable_delay",
-                        extra={"delay": delay, "model": self._model},
+                        extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
                     )
                     raise RateLimitExhausted(
-                        f"Quota exceeded for {self._model} with no retryable delay"
+                        f"Quota exceeded for {self._model} with no retryable delay "
+                        f"(dimension={dimension})"
                     ) from exc
 
                 if attempt >= self._max_retries - 1:
                     logger.error(
                         "gemini_rate_limit_max_retries_exceeded",
-                        extra={"attempts": self._max_retries, "model": self._model},
+                        extra={
+                            "attempts": self._max_retries,
+                            "model": self._model,
+                            "quota_dimension": dimension,
+                        },
                     )
                     raise RateLimitExhausted(
                         f"Quota exceeded for {self._model} after {self._max_retries} retries"
@@ -218,7 +251,12 @@ class GeminiDenseProvider:
 
                 logger.warning(
                     "gemini_rate_limited_retrying",
-                    extra={"delay": delay, "attempt": attempt + 1, "max": self._max_retries},
+                    extra={
+                        "delay": delay,
+                        "attempt": attempt + 1,
+                        "max": self._max_retries,
+                        "quota_dimension": dimension,
+                    },
                 )
                 await asyncio.sleep(delay)
 

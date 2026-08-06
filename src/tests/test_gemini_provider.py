@@ -11,6 +11,7 @@ from chatbot_plugin_sdk.providers.gemini import (
     _is_daily_quota_error,
     _is_token_quota_error,
     _parse_retry_delay,
+    _quota_dimension,
 )
 from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
 
@@ -58,6 +59,24 @@ class TestClassification:
 
     def test_parse_retry_delay_missing(self):
         assert _parse_retry_delay(DAILY_EXC) is None
+
+    def test_quota_dimension_rpd(self):
+        assert _quota_dimension(DAILY_EXC) == "rpd"
+
+    def test_quota_dimension_tpm(self):
+        assert _quota_dimension(TPM_EXC) == "tpm"
+
+    def test_quota_dimension_rpm(self):
+        assert _quota_dimension(RPM_EXC) == "rpm"
+
+    def test_quota_dimension_falls_back_to_rpm_for_other_resource_exhausted_quota_ids(self):
+        # Any RESOURCE_EXHAUSTED quotaId that isn't a Day or Token cap is
+        # assumed request-count-based (RPM), mirroring _is_token_quota_error's
+        # "request-count quotas contain Requests instead" documented split.
+        assert _quota_dimension(_quota_exc("SomeNewQuotaShape")) == "rpm"
+
+    def test_quota_dimension_unknown_for_non_resource_exhausted_429(self):
+        assert _quota_dimension(Exception("429 Too Many Requests")) == "unknown"
 
 
 # ── embed() behavior ────────────────────────────────────────────────────────
@@ -202,7 +221,10 @@ class TestEmbedRetryBehavior:
         no_delay_exc = _quota_exc("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
         with patch.object(provider, "_embed_sync", side_effect=no_delay_exc), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="no retryable delay"):
+            # dimension=rpm should surface on the raised error so a caller
+            # logging only the exception (not the SDK's own log line) can
+            # still tell which quota was exceeded.
+            with pytest.raises(RateLimitExhausted, match="no retryable delay.*dimension=rpm"):
                 await provider.embed(["a"])
         mock_sleep.assert_not_called()
 
