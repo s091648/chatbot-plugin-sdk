@@ -85,7 +85,7 @@ class EndpointProvider:
         _estimated_tokens = 0
         if self._rate_limit is not None:
             _estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
-            await self._rate_limit.acquire(_estimated_tokens)
+            await self._rate_limit.acquire(_estimated_tokens, request_units=len(texts))
 
         logger.debug(
             "embedding_request",

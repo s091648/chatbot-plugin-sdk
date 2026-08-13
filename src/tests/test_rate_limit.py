@@ -77,11 +77,29 @@ class TestComputeWait:
         strategy = SlidingWindowStrategy(rpm=2)
         # Add two stale entries (older than 60s)
         old_time = time.monotonic() - 61
-        strategy._rpm_window = deque([old_time, old_time])
+        strategy._rpm_window = deque([(old_time, 1), (old_time, 1)])
         strategy._daily_count = 2
         wait = strategy._compute_wait(0)  # should evict stale, then claim
         assert wait == 0
         assert len(strategy._rpm_window) == 1  # only the fresh one
+
+    def test_request_units_consumed_per_call(self):
+        """A batched call (request_units > 1) should consume that many RPM units at once."""
+        strategy = SlidingWindowStrategy(rpm=10)
+        wait = strategy._compute_wait(0, request_units=6)
+        assert wait == 0
+        assert strategy._rpm_window[-1] == pytest.approx((strategy._rpm_window[-1][0], 6))
+        assert strategy._daily_count == 6
+
+    def test_oversized_single_batch_admitted_once_then_blocks_window(self):
+        """A single batch whose request_units alone exceeds rpm is admitted (empty
+        window), but then occupies the whole window until it ages out."""
+        strategy = SlidingWindowStrategy(rpm=10)
+        wait = strategy._compute_wait(0, request_units=15)
+        assert wait == 0  # admitted despite exceeding rpm alone — empty window
+
+        wait2 = strategy._compute_wait(0, request_units=1)
+        assert wait2 > 0  # any further request must wait for the window to drain
 
     def test_stale_tpm_entries_evicted(self):
         strategy = SlidingWindowStrategy(rpm=100, tpm=50)

@@ -180,7 +180,7 @@ class GeminiDenseProvider:
 
         if self._rate_limit is not None:
             estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
-            await self._rate_limit.acquire(estimated_tokens)
+            await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
 
         loop = asyncio.get_event_loop()
         for attempt in range(self._max_retries):

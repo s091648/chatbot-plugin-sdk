@@ -4,7 +4,13 @@ Design notes vs. scrape-analyzer's SlidingWindowStrategy:
   - Uses asyncio.sleep() instead of time.sleep() so it doesn't block the event loop.
   - Uses threading.Lock() (not asyncio.Lock) so state is safe when an EndpointProvider
     is shared across multiple asyncio.run() calls in a ThreadPoolExecutor.
-  - Counts one request per embed() call regardless of batch size.
+  - RPM/RPD count `request_units` per embed() call (default 1; providers that batch
+    multiple texts into one HTTP call pass `len(texts)`) rather than a flat 1 per
+    call. Upstream embedding APIs (e.g. Gemini's batchEmbedContents) typically bill
+    "requests per minute" per input item, not per HTTP call, so a single embed()
+    call carrying 50 texts consumes 50 units of RPM/RPD — the same way TPM already
+    scales with `estimated_tokens` instead of being flat per call. A caller that
+    doesn't pass `request_units` keeps the old 1-unit-per-call behavior.
 """
 from __future__ import annotations
 
@@ -36,8 +42,13 @@ class RateLimitStrategy(Protocol):
     (or pass ``None``) for internal services with no external rate limits.
     """
 
-    async def acquire(self, estimated_tokens: int = 0) -> None:
-        """Await until a request slot is available.  May raise :exc:`RateLimitExhausted`."""
+    async def acquire(self, estimated_tokens: int = 0, request_units: int = 1) -> None:
+        """Await until a request slot is available.  May raise :exc:`RateLimitExhausted`.
+
+        request_units: How many RPM/RPD units this call consumes — pass
+                        ``len(texts)`` when a single call batches multiple
+                        inputs into one HTTP request. Defaults to 1.
+        """
         ...
 
     def record_usage(self, actual_tokens: int) -> None:
@@ -60,10 +71,12 @@ class SlidingWindowStrategy:
     threading lock.
 
     Args:
-        rpm: Max requests per minute.  ``0`` disables this limit.
+        rpm: Max requests per minute.  ``0`` disables this limit.  Counted in
+             ``request_units`` (see ``acquire()``), not in number of ``acquire()``
+             calls — a single call batching 50 texts consumes 50 units.
         tpm: Max tokens per minute (estimate: 4 chars ≈ 1 token).  ``0`` disables.
         rpd: Max requests per day.  When reached, :exc:`RateLimitExhausted` is raised.
-             ``0`` disables this hard cap.
+             ``0`` disables this hard cap.  Also counted in ``request_units``.
 
     Usage::
 
@@ -82,15 +95,20 @@ class SlidingWindowStrategy:
         self.rpm = rpm
         self.tpm = tpm
         self.rpd = rpd
-        self._rpm_window: deque[float] = deque()
+        self._rpm_window: deque[tuple[float, int]] = deque()
         self._tpm_window: deque[tuple[float, int]] = deque()
         self._daily_count: int = 0
         self._lock = threading.Lock()  # threading.Lock: safe across event loops
 
-    async def acquire(self, estimated_tokens: int = 0) -> None:
-        """Async-friendly wait loop.  Uses asyncio.sleep to yield the event loop."""
+    async def acquire(self, estimated_tokens: int = 0, request_units: int = 1) -> None:
+        """Async-friendly wait loop.  Uses asyncio.sleep to yield the event loop.
+
+        request_units: How many RPM/RPD units this call consumes — pass
+                        ``len(texts)`` when a single call batches multiple
+                        inputs into one HTTP request. Defaults to 1.
+        """
         while True:
-            wait = self._compute_wait(estimated_tokens)
+            wait = self._compute_wait(estimated_tokens, request_units)
             if wait == 0:
                 return
             await asyncio.sleep(wait)
@@ -105,10 +123,10 @@ class SlidingWindowStrategy:
 
     # ── internals ──────────────────────────────────────────────────────────
 
-    def _compute_wait(self, estimated_tokens: int) -> float:
+    def _compute_wait(self, estimated_tokens: int, request_units: int = 1) -> float:
         """Return seconds to sleep, or 0 if a slot is available (and claim it)."""
         with self._lock:
-            if self.rpd > 0 and self._daily_count >= self.rpd:
+            if self.rpd > 0 and self._daily_count + request_units > self.rpd:
                 raise RateLimitExhausted(
                     f"Daily request cap of {self.rpd} reached. "
                     "Switch providers or wait until tomorrow."
@@ -118,32 +136,33 @@ class SlidingWindowStrategy:
 
             wait = 0.0
             if self.rpm > 0:
-                wait = max(wait, self._rpm_wait(now))
+                wait = max(wait, self._rpm_wait(now, request_units))
             if self.tpm > 0 and estimated_tokens > 0:
                 wait = max(wait, self._tpm_wait(now, estimated_tokens))
 
             if wait == 0:
                 # Claim the slot
                 if self.rpm > 0:
-                    self._rpm_window.append(now)
-                self._daily_count += 1
+                    self._rpm_window.append((now, request_units))
+                self._daily_count += request_units
                 if self.tpm > 0:
                     self._tpm_window.append((now, estimated_tokens))
             return wait
 
     def _evict_stale(self, now: float) -> None:
         cutoff = now - self._WINDOW
-        while self._rpm_window and self._rpm_window[0] < cutoff:
+        while self._rpm_window and self._rpm_window[0][0] < cutoff:
             self._rpm_window.popleft()
         while self._tpm_window and self._tpm_window[0][0] < cutoff:
             self._tpm_window.popleft()
 
-    def _rpm_wait(self, now: float) -> float:
-        if len(self._rpm_window) < self.rpm:
+    def _rpm_wait(self, now: float, request_units: int) -> float:
+        used = sum(u for _, u in self._rpm_window)
+        if used + request_units <= self.rpm:
             return 0.0
         if not self._rpm_window:
             return 0.0
-        return max(0.0, self._WINDOW - (now - self._rpm_window[0]))
+        return max(0.0, self._WINDOW - (now - self._rpm_window[0][0]))
 
     def _tpm_wait(self, now: float, estimated_tokens: int) -> float:
         used = sum(t for _, t in self._tpm_window)

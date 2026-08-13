@@ -65,7 +65,7 @@ class HuggingFaceDenseProvider:
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if self._rate_limit is not None:
             estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
-            await self._rate_limit.acquire(estimated_tokens)
+            await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
 
         payload = {"inputs": texts, "options": {"wait_for_model": True}}
 
