@@ -60,6 +60,28 @@ class TestClassification:
     def test_parse_retry_delay_missing(self):
         assert _parse_retry_delay(DAILY_EXC) is None
 
+    def test_parse_retry_delay_structured_retry_delay_field(self):
+        # google-genai's ClientError renders its structured error body as a
+        # dict literal in str(exc) — e.g. "'retryDelay': '13s'" — which the
+        # prose-only "retry in Xs" regex does not match.
+        exc = Exception(
+            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'status': "
+            "'RESOURCE_EXHAUSTED', 'details': [{'@type': "
+            "'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '13s'}]}}"
+        )
+        assert _parse_retry_delay(exc) == 13.0
+
+    def test_parse_retry_delay_no_retry_info_at_all(self):
+        # Real-world case: Google's 429 body carries only a Help link, no
+        # RetryInfo and no prose delay — must resolve to None, not raise.
+        exc = Exception(
+            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': "
+            "'You exceeded your current quota, please check your plan and "
+            "billing details.', 'status': 'RESOURCE_EXHAUSTED', 'details': "
+            "[{'@type': 'type.googleapis.com/google.rpc.Help', 'links': []}]}}"
+        )
+        assert _parse_retry_delay(exc) is None
+
     def test_quota_dimension_rpd(self):
         assert _quota_dimension(DAILY_EXC) == "rpd"
 
@@ -216,17 +238,36 @@ class TestEmbedRetryBehavior:
         mock_sleep.assert_awaited_once_with(5.0)
 
     @pytest.mark.asyncio
-    async def test_no_parseable_delay_raises_immediately(self):
-        provider = _make_provider()
+    async def test_no_parseable_delay_falls_back_to_default_backoff_and_retries(self):
+        # A 429 confirmed non-daily but with no parseable retryDelay must not
+        # be treated as fatal — it should back off with the fixed default
+        # delay and retry, the same posture as a parsed RPM/TPM delay.
+        provider = _make_provider(max_retries=3)
+        calls = {"n": 0}
+        no_delay_exc = _quota_exc("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
+
+        def fake_embed_sync(texts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise no_delay_exc
+            return [[0.1] * 768 for _ in texts]
+
+        with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
+             patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await provider.embed(["a"])
+
+        assert result == [[0.1] * 768]
+        mock_sleep.assert_awaited_once_with(15.0)
+
+    @pytest.mark.asyncio
+    async def test_no_parseable_delay_exhausts_max_retries_then_raises(self):
+        provider = _make_provider(max_retries=2)
         no_delay_exc = _quota_exc("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
         with patch.object(provider, "_embed_sync", side_effect=no_delay_exc), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            # dimension=rpm should surface on the raised error so a caller
-            # logging only the exception (not the SDK's own log line) can
-            # still tell which quota was exceeded.
-            with pytest.raises(RateLimitExhausted, match="no retryable delay.*dimension=rpm"):
+            with pytest.raises(RateLimitExhausted, match="after 2 retries"):
                 await provider.embed(["a"])
-        mock_sleep.assert_not_called()
+        mock_sleep.assert_awaited_once_with(15.0)
 
     @pytest.mark.asyncio
     async def test_delay_over_threshold_raises_immediately(self):
@@ -236,7 +277,7 @@ class TestEmbedRetryBehavior:
         )
         with patch.object(provider, "_embed_sync", side_effect=long_delay_exc), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="no retryable delay"):
+            with pytest.raises(RateLimitExhausted, match="exceeding the 300.0s threshold"):
                 await provider.embed(["a"])
         mock_sleep.assert_not_called()
 
