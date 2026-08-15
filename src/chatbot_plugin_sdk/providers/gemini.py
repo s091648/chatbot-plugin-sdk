@@ -17,15 +17,28 @@ logger = logging.getLogger(__name__)
 # waiting would block the pipeline for hours, so we let the error propagate.
 _MAX_RETRYABLE_DELAY_SECS = 300.0
 
+# Fallback wait when a 429 is confirmed non-daily (RPM/TPM/unknown) but its
+# body carries no parseable delay at all (e.g. Google's response includes
+# only a `google.rpc.Help` link, no `RetryInfo`) — retried the same as a
+# parsed delay would be, since the only alternative (giving up immediately)
+# throws away recoverable requests: a same-process quota this narrow
+# typically clears within seconds, not hours.
+_DEFAULT_QUOTA_BACKOFF_SECS = 15.0
+
 
 def _parse_retry_delay(exc: Exception) -> float | None:
     """Extract the Google-suggested retry delay (seconds) from a 429 error.
 
-    Scans the exception message for ``'retry in Xs'`` or the ``retryDelay`` field.
-    Returns ``None`` when no parseable delay is found.
+    Scans the exception message for the structured ``retryDelay`` field as
+    rendered in google-genai's ``ClientError`` string form (e.g.
+    ``"retryDelay": "13s"``) or the prose form ``'retry in Xs'``. Returns
+    ``None`` when no parseable delay is found.
     """
     try:
         msg = str(exc)
+        m = re.search(r'retryDelay["\']?\s*[:=]\s*["\']?(\d+(?:\.\d+)?)s', msg, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
         m = re.search(r'retry(?:\s+in)?\s+(\d+(?:\.\d+)?)s', msg, re.IGNORECASE)
         if m:
             return float(m.group(1))
@@ -116,13 +129,19 @@ class GeminiDenseProvider:
     *and* halve the batch before retrying each half — waiting alone doesn't
     help when the batch itself is the problem, and halving alone doesn't help
     if requests are still fired back-to-back, so the two are combined.
-    A 429 with no parseable ``retryDelay`` (Google's error body doesn't
-    always include one), a delay longer than 5 minutes, or repeated 429s past
-    ``max_retries`` are all treated the same way — raised as
-    ``RateLimitExhausted`` rather than the raw ``google.genai`` exception, so
-    every quota-exhaustion path is catchable by callers as one type. Any
-    other failure (network error, malformed response, auth failure) is
-    raised as ``EmbeddingError``, never the raw SDK/HTTP exception.
+    A 429 confirmed as non-daily (RPM/TPM/unknown) but with no parseable
+    ``retryDelay`` (Google's error body doesn't always include one — e.g. it
+    may carry only a ``google.rpc.Help`` link) falls back to a fixed
+    ``_DEFAULT_QUOTA_BACKOFF_SECS`` wait and retries like any other RPM/TPM
+    429, instead of giving up: the only evidence available (``dimension !=
+    rpd``) says this is expected to clear on its own, so treating "can't
+    parse a delay" as fatal would throw away recoverable requests. A delay
+    Google *does* supply that exceeds 5 minutes, or repeated 429s past
+    ``max_retries``, are raised as ``RateLimitExhausted`` rather than the raw
+    ``google.genai`` exception, so every quota-exhaustion path is catchable
+    by callers as one type. Any other failure (network error, malformed
+    response, auth failure) is raised as ``EmbeddingError``, never the raw
+    SDK/HTTP exception.
 
     Args:
         api_key: Gemini API key.
@@ -226,15 +245,30 @@ class GeminiDenseProvider:
                     right = await self.embed(texts[mid:])
                     return left + right
 
-                if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
+                if delay is not None and delay > _MAX_RETRYABLE_DELAY_SECS:
                     logger.error(
-                        "gemini_quota_no_retryable_delay",
+                        "gemini_quota_delay_too_long",
                         extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
                     )
                     raise RateLimitExhausted(
-                        f"Quota exceeded for {self._model} with no retryable delay "
+                        f"Quota exceeded for {self._model} with retry delay {delay}s "
+                        f"exceeding the {_MAX_RETRYABLE_DELAY_SECS}s threshold "
                         f"(dimension={dimension})"
                     ) from exc
+
+                if delay is None:
+                    # Confirmed non-daily (the RPD branch above already returned/raised),
+                    # but Google's body carried no parseable delay — assume it's still
+                    # recoverable and back off with a fixed wait rather than giving up.
+                    delay = _DEFAULT_QUOTA_BACKOFF_SECS
+                    logger.warning(
+                        "gemini_quota_no_retryable_delay_fallback_backoff",
+                        extra={
+                            "fallback_delay": delay,
+                            "model": self._model,
+                            "quota_dimension": dimension,
+                        },
+                    )
 
                 if attempt >= self._max_retries - 1:
                     logger.error(
