@@ -279,7 +279,7 @@ wheels = [
 
 [[package]]
 name = "chatbot-plugin-sdk"
-version = "0.15.2"
+version = "1.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },

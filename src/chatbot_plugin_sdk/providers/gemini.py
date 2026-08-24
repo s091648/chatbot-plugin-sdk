@@ -273,15 +273,30 @@ class GeminiDenseProvider:
                         right = await self.embed(texts[mid:])
                         return left + right
 
-                    if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
+                    if delay is not None and delay > _MAX_RETRYABLE_DELAY_SECS:
                         logger.error(
-                            "gemini_quota_no_retryable_delay",
+                            "gemini_quota_delay_too_long",
                             extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
                         )
                         raise RateLimitExhausted(
-                            f"Quota exceeded for {self._model} with no retryable delay "
+                            f"Quota exceeded for {self._model} with retry delay {delay}s "
+                            f"exceeding the {_MAX_RETRYABLE_DELAY_SECS}s threshold "
                             f"(dimension={dimension})"
                         ) from exc
+
+                    if delay is None:
+                        # Confirmed non-daily (the RPD branch above already returned/raised),
+                        # but Google's body carried no parseable delay — assume it's still
+                        # recoverable and back off with a fixed wait rather than giving up.
+                        delay = _DEFAULT_QUOTA_BACKOFF_SECS
+                        logger.warning(
+                            "gemini_quota_no_retryable_delay_fallback_backoff",
+                            extra={
+                                "fallback_delay": delay,
+                                "model": self._model,
+                                "quota_dimension": dimension,
+                            },
+                        )
 
                     if attempt >= self._max_retries - 1:
                         logger.error(
