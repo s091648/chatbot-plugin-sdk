@@ -7,8 +7,8 @@ The two processors are the main entry points for the SDK.  Configure once, then 
 ::: chatbot_plugin_sdk.processors.ingest.IngestProcessor
     options:
       members:
+        - __init__
         - configure
-        - ensure_ready
         - ingest
 
 ## RetrieveProcessor
@@ -16,6 +16,6 @@ The two processors are the main entry points for the SDK.  Configure once, then 
 ::: chatbot_plugin_sdk.processors.retrieve.RetrieveProcessor
     options:
       members:
+        - __init__
         - configure
-        - ensure_ready
-        - search
+        - retrieve
