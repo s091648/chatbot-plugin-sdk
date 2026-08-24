@@ -24,6 +24,13 @@ jobs:
   #
   # Only runs for an actual tag push — workflow_dispatch (manual docs
   # rebuild, no tag involved) skips straight to deploy-docs.
+  #
+  # main is a protected branch (PR required, "Pytest" required check), so a
+  # plain `git push` from the default GITHUB_TOKEN's github-actions[bot]
+  # identity gets rejected. Commits via the GitHub Contents API instead,
+  # using RELEASE_PAT — a PAT belonging to an account with branch-protection
+  # bypass — same pattern scrape-analyzer's own release.yml uses for the
+  # identical problem (commit-file-via-api.sh).
   # -----------------------------------------------------------------------
   bump-version:
     name: Bump Version
@@ -33,8 +40,11 @@ jobs:
     if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
 
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -44,20 +54,24 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
 
-      - name: Commit version bump
+      - name: Commit version bump via API
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml
-          git commit -m "chore: bump version to $VERSION [skip ci]"
-          git push origin HEAD:refs/heads/main
+          bash "$GITHUB_WORKSPACE/.github/scripts/commit-file-via-api.sh" \
+            "pyproject.toml" "${{ github.repository }}" "main" \
+            "chore: bump version to $VERSION [skip ci]"
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
 
       - name: Move tag to version bump commit
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          git tag -f "$TAG_NAME"
-          git push origin "refs/tags/$TAG_NAME" --force
+          git fetch origin main
+          NEW_SHA=$(git rev-parse origin/main)
+          gh api --method PATCH "/repos/${{ github.repository }}/git/refs/tags/$TAG_NAME" \
+            --field sha="$NEW_SHA" --field force=true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
 
   # -----------------------------------------------------------------------
   # Build the MkDocs site from main — by the time this runs, bump-version
