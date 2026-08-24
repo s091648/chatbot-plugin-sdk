@@ -15,6 +15,12 @@ dependencies = [
 fastembed = ["fastembed>=0.3"]
 sync = ["psycopg2-binary>=2.9"]
 gemini = ["google-genai>=1.0"]
+# Tracing is fully optional — GeminiDenseProvider/RetrieveProcessor accept
+# an injected `tracer` (chatbot_plugin_sdk.protocols.Tracer) and otherwise
+# fall back to real OpenTelemetry only if this extra (or the host app's own
+# opentelemetry-api install) is present, else a no-op. See protocols.py's
+# `default_tracer()`.
+otel = ["opentelemetry-api"]
 
 [dependency-groups]
 dev = [
