@@ -6,7 +6,7 @@ from typing import Any
 from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
 from chatbot_plugin_sdk.exceptions import NotConfiguredError
-from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
+from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider, Tracer, default_tracer
 from chatbot_plugin_sdk.rerankers.base import Reranker
 
 logger = logging.getLogger(__name__)
@@ -72,14 +72,20 @@ class RetrieveProcessor:
         )
         result = await retriever.retrieve("What is RAG?")
         # result.chunks: list[ChunkResult] — pass to your LLM
+
+    Pass a `tracer` to route retrieve.* spans into your own already-configured
+    OpenTelemetry TracerProvider (or any other Tracer-protocol implementation);
+    omitted, this uses real OTel if opentelemetry-api is installed, else a
+    no-op — see `chatbot_plugin_sdk.protocols.default_tracer`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tracer: Tracer | None = None) -> None:
         self._backend: DatabaseBackend | None = None
         self._dense: DenseEmbeddingProvider | None = None
         self._sparse: SparseEmbeddingProvider | None = None
         self._reranker: Reranker | None = None
         self._ready: bool = False
+        self._tracer: Tracer = tracer or default_tracer(__name__)
 
     def configure(
         self,
@@ -120,7 +126,8 @@ class RetrieveProcessor:
         Returns:
             :class:`SearchResponse` with chunks ordered by descending similarity score.
         """
-        await self._ensure_ready()
+        with self._tracer.start_as_current_span("retrieve.ensure_ready"):
+            await self._ensure_ready()
 
         candidate_k = top_k * 3 if self._reranker is not None else top_k
         logger.debug(
@@ -132,15 +139,23 @@ class RetrieveProcessor:
         )
 
         # ── Retrieval ─────────────────────────────────────────────────────────
+        # Phase-level spans so a slow retrieve() breaks down into "was it embedding the
+        # query, searching Postgres, or reranking" instead of one opaque span — embed()
+        # in particular can hide real latency: GeminiDenseProvider.embed() offloads the
+        # actual API call to a thread pool (see its own span/comment), which asyncio
+        # does not propagate OTel context into, so without this wrapping span here that
+        # call's duration would be invisible in the trace entirely.
         if self._dense is not None and self._sparse is not None:
-            dense_vecs, sparse_vecs = await _gather(
-                self._dense.embed([query]),
-                self._sparse.embed([query]),
-            )
-            dense_rows, sparse_rows = await _gather(
-                self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters),
-                self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters),
-            )
+            with self._tracer.start_as_current_span("retrieve.embed"):
+                dense_vecs, sparse_vecs = await _gather(
+                    self._dense.embed([query]),
+                    self._sparse.embed([query]),
+                )
+            with self._tracer.start_as_current_span("retrieve.search"):
+                dense_rows, sparse_rows = await _gather(
+                    self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters),
+                    self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters),
+                )
             merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
             ranked_rows = [r for r, _ in merged]
             rrf_scores = {r.chunk_id: s for r, s in merged}
@@ -148,22 +163,27 @@ class RetrieveProcessor:
                 ranked_rows = [r for r in ranked_rows if rrf_scores.get(r.chunk_id, 0) >= min_score]
 
         elif self._dense is not None:
-            dense_vecs = await self._dense.embed([query])
-            ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters)
+            with self._tracer.start_as_current_span("retrieve.embed"):
+                dense_vecs = await self._dense.embed([query])
+            with self._tracer.start_as_current_span("retrieve.search"):
+                ranked_rows = await self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (1.0 - r.distance) >= min_score]
 
         else:
-            sparse_vecs = await self._sparse.embed([query])  # type: ignore[union-attr]
-            ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters)
+            with self._tracer.start_as_current_span("retrieve.embed"):
+                sparse_vecs = await self._sparse.embed([query])  # type: ignore[union-attr]
+            with self._tracer.start_as_current_span("retrieve.search"):
+                ranked_rows = await self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters)
             rrf_scores = {}
             if min_score > 0:
                 ranked_rows = [r for r in ranked_rows if (-r.distance) >= min_score]
 
         # ── Re-rank ───────────────────────────────────────────────────────────
         if self._reranker is not None:
-            reranked = await self._reranker.rerank(query, ranked_rows)
+            with self._tracer.start_as_current_span("retrieve.rerank"):
+                reranked = await self._reranker.rerank(query, ranked_rows)
             if min_rerank_score > 0:
                 reranked = [(r, s) for r, s in reranked if s >= min_rerank_score]
             result = SearchResponse(chunks=[

@@ -48,7 +48,15 @@ from chatbot_plugin_sdk.providers.huggingface import HuggingFaceDenseProvider
 from chatbot_plugin_sdk.providers import build_dense_provider, build_sparse_provider
 from chatbot_plugin_sdk.config import DatabaseConfig
 from chatbot_plugin_sdk.contracts.responses import SearchResponse, ChunkResult
-from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
+from chatbot_plugin_sdk.protocols import (
+    DenseEmbeddingProvider,
+    SparseEmbeddingProvider,
+    Span,
+    Tracer,
+    NoOpSpan,
+    NoOpTracer,
+    default_tracer,
+)
 from chatbot_plugin_sdk.exceptions import (
     ToolboxError,
     NotConfiguredError,
@@ -90,6 +98,12 @@ __all__ = [
     # Protocols
     "DenseEmbeddingProvider",
     "SparseEmbeddingProvider",
+    # Tracing
+    "Span",
+    "Tracer",
+    "NoOpSpan",
+    "NoOpTracer",
+    "default_tracer",
     # Rerankers
     "Reranker",
     "FastEmbedReranker",

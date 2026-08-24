@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+from chatbot_plugin_sdk.protocols import Tracer, default_tracer
 from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
 
 if TYPE_CHECKING:
@@ -140,6 +141,12 @@ class GeminiDenseProvider:
                     Default ``False`` — opt in only if TPM 429s are observed;
                     the default RPM-style wait-and-retry already recovers once
                     the sliding window resets.
+        tracer: Optional Tracer-protocol implementation to route this
+                    provider's spans into your own already-configured
+                    OpenTelemetry TracerProvider (or any other Tracer
+                    implementation). Omitted, this uses real OTel if
+                    opentelemetry-api is installed, else a no-op — see
+                    ``chatbot_plugin_sdk.protocols.default_tracer``.
     """
 
     def __init__(
@@ -150,6 +157,7 @@ class GeminiDenseProvider:
         rate_limit: "RateLimitStrategy | None" = None,
         max_retries: int = 5,
         split_batch_on_tpm: bool = False,
+        tracer: Tracer | None = None,
     ) -> None:
         from google import genai
         self._client = genai.Client(api_key=api_key)
@@ -159,6 +167,7 @@ class GeminiDenseProvider:
         self._max_retries = max_retries
         self._split_batch_on_tpm = split_batch_on_tpm
         self._daily_exhausted = False
+        self._tracer: Tracer = tracer or default_tracer(__name__)
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         response = self._client.models.embed_content(
@@ -178,86 +187,105 @@ class GeminiDenseProvider:
                 f"Daily quota already exhausted for {self._model} this run"
             )
 
-        if self._rate_limit is not None:
-            estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
-            await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
+        # embed() is a plain coroutine (no yield to a caller mid-span), so
+        # start_as_current_span() as a `with` is safe here — unlike the
+        # generator-based spans elsewhere in this codebase (see e.g.
+        # chatbot-plugin's chat_service.py), there's no risk of resuming in a
+        # different contextvars.Context.
+        #
+        # _embed_sync() runs the actual Gemini API call via the *synchronous*
+        # google-genai client, offloaded to the default ThreadPoolExecutor via
+        # run_in_executor — asyncio does NOT propagate the current
+        # contextvars.Context into that worker thread, so any span the sync
+        # client's own HTTP layer might create is invisible/orphaned from
+        # this trace. The "embed_sync_done" event on *this* span is the only
+        # place that call's real duration is actually visible.
+        with self._tracer.start_as_current_span(
+            "gemini_dense.embed", attributes={"model": self._model, "text_count": len(texts)},
+        ) as span:
+            if self._rate_limit is not None:
+                estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+                await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
+                span.add_event("rate_limit_acquired")
 
-        loop = asyncio.get_event_loop()
-        for attempt in range(self._max_retries):
-            try:
-                return await loop.run_in_executor(None, self._embed_sync, texts)
-            except Exception as exc:
-                if not _is_quota_error(exc):
-                    raise EmbeddingError(
-                        f"Gemini embedding request failed: {exc}"
-                    ) from exc
+            loop = asyncio.get_event_loop()
+            for attempt in range(self._max_retries):
+                try:
+                    result = await loop.run_in_executor(None, self._embed_sync, texts)
+                    span.add_event("embed_sync_done")
+                    return result
+                except Exception as exc:
+                    if not _is_quota_error(exc):
+                        raise EmbeddingError(
+                            f"Gemini embedding request failed: {exc}"
+                        ) from exc
 
-                if _is_daily_quota_error(exc):
-                    self._daily_exhausted = True
-                    logger.error(
-                        "gemini_daily_quota_exhausted",
-                        extra={"model": self._model, "quota_dimension": "rpd"},
-                    )
-                    raise RateLimitExhausted(
-                        f"Daily quota exceeded for {self._model}"
-                    ) from exc
+                    if _is_daily_quota_error(exc):
+                        self._daily_exhausted = True
+                        logger.error(
+                            "gemini_daily_quota_exhausted",
+                            extra={"model": self._model, "quota_dimension": "rpd"},
+                        )
+                        raise RateLimitExhausted(
+                            f"Daily quota exceeded for {self._model}"
+                        ) from exc
 
-                delay = _parse_retry_delay(exc)
-                dimension = _quota_dimension(exc)
+                    delay = _parse_retry_delay(exc)
+                    dimension = _quota_dimension(exc)
 
-                if (
-                    self._split_batch_on_tpm
-                    and len(texts) > 1
-                    and _is_token_quota_error(exc)
-                ):
+                    if (
+                        self._split_batch_on_tpm
+                        and len(texts) > 1
+                        and _is_token_quota_error(exc)
+                    ):
+                        logger.warning(
+                            "gemini_tpm_quota_split",
+                            extra={
+                                "batch_size": len(texts),
+                                "delay": delay,
+                                "model": self._model,
+                                "quota_dimension": dimension,
+                            },
+                        )
+                        if delay is not None and delay <= _MAX_RETRYABLE_DELAY_SECS:
+                            await asyncio.sleep(delay)
+                        mid = len(texts) // 2
+                        left = await self.embed(texts[:mid])
+                        right = await self.embed(texts[mid:])
+                        return left + right
+
+                    if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
+                        logger.error(
+                            "gemini_quota_no_retryable_delay",
+                            extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
+                        )
+                        raise RateLimitExhausted(
+                            f"Quota exceeded for {self._model} with no retryable delay "
+                            f"(dimension={dimension})"
+                        ) from exc
+
+                    if attempt >= self._max_retries - 1:
+                        logger.error(
+                            "gemini_rate_limit_max_retries_exceeded",
+                            extra={
+                                "attempts": self._max_retries,
+                                "model": self._model,
+                                "quota_dimension": dimension,
+                            },
+                        )
+                        raise RateLimitExhausted(
+                            f"Quota exceeded for {self._model} after {self._max_retries} retries"
+                        ) from exc
+
                     logger.warning(
-                        "gemini_tpm_quota_split",
+                        "gemini_rate_limited_retrying",
                         extra={
-                            "batch_size": len(texts),
                             "delay": delay,
-                            "model": self._model,
+                            "attempt": attempt + 1,
+                            "max": self._max_retries,
                             "quota_dimension": dimension,
                         },
                     )
-                    if delay is not None and delay <= _MAX_RETRYABLE_DELAY_SECS:
-                        await asyncio.sleep(delay)
-                    mid = len(texts) // 2
-                    left = await self.embed(texts[:mid])
-                    right = await self.embed(texts[mid:])
-                    return left + right
+                    await asyncio.sleep(delay)
 
-                if delay is None or delay > _MAX_RETRYABLE_DELAY_SECS:
-                    logger.error(
-                        "gemini_quota_no_retryable_delay",
-                        extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
-                    )
-                    raise RateLimitExhausted(
-                        f"Quota exceeded for {self._model} with no retryable delay "
-                        f"(dimension={dimension})"
-                    ) from exc
-
-                if attempt >= self._max_retries - 1:
-                    logger.error(
-                        "gemini_rate_limit_max_retries_exceeded",
-                        extra={
-                            "attempts": self._max_retries,
-                            "model": self._model,
-                            "quota_dimension": dimension,
-                        },
-                    )
-                    raise RateLimitExhausted(
-                        f"Quota exceeded for {self._model} after {self._max_retries} retries"
-                    ) from exc
-
-                logger.warning(
-                    "gemini_rate_limited_retrying",
-                    extra={
-                        "delay": delay,
-                        "attempt": attempt + 1,
-                        "max": self._max_retries,
-                        "quota_dimension": dimension,
-                    },
-                )
-                await asyncio.sleep(delay)
-
-        raise RuntimeError("unreachable")
+            raise RuntimeError("unreachable")
