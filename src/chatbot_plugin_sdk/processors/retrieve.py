@@ -140,11 +140,15 @@ class RetrieveProcessor:
 
         # ── Retrieval ─────────────────────────────────────────────────────────
         # Phase-level spans so a slow retrieve() breaks down into "was it embedding the
-        # query, searching Postgres, or reranking" instead of one opaque span — embed()
-        # in particular can hide real latency: GeminiDenseProvider.embed() offloads the
-        # actual API call to a thread pool (see its own span/comment), which asyncio
-        # does not propagate OTel context into, so without this wrapping span here that
-        # call's duration would be invisible in the trace entirely.
+        # query, searching Postgres, fusing the two rank lists, or reranking" instead of
+        # one opaque span — embed() in particular can hide real latency:
+        # GeminiDenseProvider.embed() offloads the actual API call to a thread pool (see
+        # its own span/comment), which asyncio does not propagate OTel context into, so
+        # without this wrapping span here that call's duration would be invisible in the
+        # trace entirely. retrieve.rrf_merge is pure in-process CPU (no I/O) but is still
+        # spanned separately from retrieve.search — without it, any time between
+        # retrieve.search ending and the caller's next span starting (fusion + building
+        # ChunkResult/SearchResponse) was invisible dead space in the waterfall.
         if self._dense is not None and self._sparse is not None:
             with self._tracer.start_as_current_span("retrieve.embed"):
                 dense_vecs, sparse_vecs = await _gather(
@@ -156,11 +160,14 @@ class RetrieveProcessor:
                     self._backend.search_dense(dense_vecs[0], candidate_k, filters=filters),
                     self._backend.search_sparse(sparse_vecs[0], candidate_k, filters=filters),
                 )
-            merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
-            ranked_rows = [r for r, _ in merged]
-            rrf_scores = {r.chunk_id: s for r, s in merged}
-            if min_score > 0:
-                ranked_rows = [r for r in ranked_rows if rrf_scores.get(r.chunk_id, 0) >= min_score]
+            with self._tracer.start_as_current_span(
+                "retrieve.rrf_merge", attributes={"dense_count": len(dense_rows), "sparse_count": len(sparse_rows)},
+            ):
+                merged = _rrf_merge(dense_rows, sparse_rows)[:candidate_k]
+                ranked_rows = [r for r, _ in merged]
+                rrf_scores = {r.chunk_id: s for r, s in merged}
+                if min_score > 0:
+                    ranked_rows = [r for r in ranked_rows if rrf_scores.get(r.chunk_id, 0) >= min_score]
 
         elif self._dense is not None:
             with self._tracer.start_as_current_span("retrieve.embed"):
