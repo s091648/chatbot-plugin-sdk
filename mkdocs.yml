@@ -32,6 +32,7 @@ nav:
     - Embedding Providers: guide/providers.md
   - API Reference:
     - Processors: api/processors.md
+    - Batching: api/batching.md
     - Backends: api/backends.md
     - Providers: api/providers.md
     - Config: api/config.md

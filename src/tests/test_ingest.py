@@ -1,5 +1,6 @@
 """Tests for IngestProcessor."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -109,6 +110,34 @@ class TestIngestConfigure:
         assert processor._chunk_size == DEFAULT_CHUNK_SIZE
         assert processor._chunk_overlap == DEFAULT_CHUNK_OVERLAP
 
+    def test_builds_dense_coordinator_when_dense_configured(self):
+        from chatbot_plugin_sdk import EmbeddingBatchCoordinator
+        processor = IngestProcessor()
+        processor.configure(backend=_mock_backend(), dense=EndpointProvider(url="http://x", dimension=768))
+        assert isinstance(processor._dense_coordinator, EmbeddingBatchCoordinator)
+
+    def test_no_dense_coordinator_when_sparse_only(self):
+        processor = IngestProcessor()
+        processor.configure(backend=_mock_backend(), sparse=EndpointProvider(url="http://x", response_key="sparse"))
+        assert processor._dense_coordinator is None
+
+    def test_custom_embed_queue_factory_reaches_coordinator(self):
+        import asyncio
+        created = []
+
+        def factory():
+            q = asyncio.Queue()
+            created.append(q)
+            return q
+
+        processor = IngestProcessor()
+        processor.configure(
+            backend=_mock_backend(),
+            dense=EndpointProvider(url="http://x", dimension=768),
+            embed_queue_factory=factory,
+        )
+        assert processor._dense_coordinator._queue_factory is factory
+
 
 # ── _ensure_ready() ─────────────────────────────────────────────────────────────
 
@@ -190,10 +219,18 @@ class TestIngestPipeline:
 
     @pytest.mark.asyncio
     async def test_raises_on_dense_vector_count_mismatch(self):
+        """A batch-level vector/text count mismatch is now caught inside
+        EmbeddingBatchCoordinator (see test_batching.py's dedicated regression
+        test) before _embed_in_batches_dense() can ever return a short list —
+        so ingest()'s own post-hoc DatabaseError check (still present as a
+        defensive backstop) is no longer reachable for the dense path with a
+        single-batch mismatch; the failure now surfaces as EmbeddingError."""
+        from chatbot_plugin_sdk.exceptions import EmbeddingError
+
         processor, _ = _configured_processor()
         with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
             mock_embed.return_value = [[0.1] * 768]  # only 1 vector for many chunks
-            with pytest.raises(DatabaseError, match="Dense embedding returned"):
+            with pytest.raises(EmbeddingError, match="vectors"):
                 await processor.ingest(
                     "Hello world. " * 100,
                     articles_column_values={"url": "https://example.com/article"},
@@ -234,3 +271,73 @@ class TestIngestArticleColumns:
 
         call_kwargs = backend.upsert.call_args.kwargs
         assert call_kwargs.get("articles_column_values") == columns
+
+
+# ── aclose() ───────────────────────────────────────────────────────────────────
+
+class TestAclose:
+    @pytest.mark.asyncio
+    async def test_aclose_before_configure_is_a_noop(self):
+        processor = IngestProcessor()
+        await processor.aclose()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_aclose_cancels_dense_coordinator_worker(self):
+        processor, backend = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
+                "Hello world. " * 100,
+                articles_column_values={"url": "https://example.com/article"},
+            )
+        worker = processor._dense_coordinator._worker_task
+        await processor.aclose()
+        assert worker.cancelled() or worker.done()
+
+
+# ── get_embed_queue() / set_embed_queue() ───────────────────────────────────────
+
+class TestGetSetEmbedQueue:
+    def test_get_embed_queue_returns_none_when_dense_not_configured(self):
+        processor = IngestProcessor()
+        processor.configure(backend=_mock_backend(), sparse=EndpointProvider(url="http://x", response_key="sparse"))
+        assert processor.get_embed_queue() is None
+
+    def test_get_embed_queue_returns_none_before_first_use(self):
+        processor, _ = _configured_processor()
+        assert processor.get_embed_queue() is None
+
+    @pytest.mark.asyncio
+    async def test_get_embed_queue_returns_current_queue_after_first_use(self):
+        processor, _ = _configured_processor()
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
+                "Hello world. " * 100,
+                articles_column_values={"url": "https://example.com/article"},
+            )
+        assert processor.get_embed_queue() is processor._dense_coordinator._queue
+        await processor.aclose()
+
+    @pytest.mark.asyncio
+    async def test_set_embed_queue_raises_when_dense_not_configured(self):
+        processor = IngestProcessor()
+        processor.configure(backend=_mock_backend(), sparse=EndpointProvider(url="http://x", response_key="sparse"))
+        with pytest.raises(NotConfiguredError):
+            await processor.set_embed_queue(asyncio.Queue())
+
+    @pytest.mark.asyncio
+    async def test_set_embed_queue_swaps_the_coordinators_queue(self):
+        processor, _ = _configured_processor()
+        custom_queue = asyncio.Queue()
+        await processor.set_embed_queue(custom_queue)
+        assert processor.get_embed_queue() is custom_queue
+
+        with patch.object(processor._dense, "embed", new_callable=AsyncMock) as mock_embed:
+            mock_embed.side_effect = lambda texts: [[0.1] * 768 for _ in texts]
+            await processor.ingest(
+                "Hello world. " * 100,
+                articles_column_values={"url": "https://example.com/article"},
+            )
+        assert processor.get_embed_queue() is custom_queue
+        await processor.aclose()
