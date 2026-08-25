@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import unicodedata
@@ -7,6 +8,7 @@ import uuid
 from typing import Any
 
 from chatbot_plugin_sdk.backends.base import DatabaseBackend
+from chatbot_plugin_sdk.batching import EmbeddingBatchCoordinator, EmbedWorkItem, QueueFactory
 from chatbot_plugin_sdk.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, _chunk_text
 from chatbot_plugin_sdk.exceptions import DatabaseError, NotConfiguredError
 from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
@@ -56,6 +58,7 @@ class IngestProcessor:
         self._embed_batch_size: int = 16
         self._chunk_size: int = DEFAULT_CHUNK_SIZE
         self._chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
+        self._dense_coordinator: EmbeddingBatchCoordinator | None = None
 
     def configure(
         self,
@@ -63,6 +66,7 @@ class IngestProcessor:
         dense: DenseEmbeddingProvider | None = None,
         sparse: SparseEmbeddingProvider | None = None,
         embed_batch_size: int = 16,
+        embed_queue_factory: QueueFactory | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
@@ -72,6 +76,12 @@ class IngestProcessor:
             embed_batch_size: Max chunks sent to each provider's ``embed()`` per
                               call. Smaller values reduce peak memory when using
                               local ONNX models (e.g. SPLADE). Default: 16.
+            embed_queue_factory: Optional factory for the dense-embedding
+                              coordinator's internal queue (see
+                              ``EmbeddingBatchCoordinator``) — inject a custom
+                              ``asyncio.Queue`` subclass (priority ordering,
+                              instrumentation, etc.) here. Defaults to a plain
+                              ``asyncio.Queue()``. Ignored when ``dense`` is None.
             chunk_size: Maximum characters per chunk. Default: 500.
             chunk_overlap: Overlap characters between consecutive chunks. Default: 50.
         """
@@ -86,6 +96,12 @@ class IngestProcessor:
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
         self._ready = False
+        self._dense_coordinator = (
+            EmbeddingBatchCoordinator(
+                dense=dense, embed_batch_size=embed_batch_size, queue_factory=embed_queue_factory,
+            )
+            if dense is not None else None
+        )
 
     async def _ensure_ready(self) -> None:
         """Idempotent first-use initialisation — delegates to backend.setup()."""
@@ -101,11 +117,35 @@ class IngestProcessor:
         logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
 
     async def _embed_in_batches_dense(self, chunks: list[str]) -> list[list[float]]:
-        results: list[list[float]] = []
-        for i in range(0, len(chunks), self._embed_batch_size):
-            batch = chunks[i : i + self._embed_batch_size]
-            results.extend(await self._dense.embed(batch))  # type: ignore[union-attr]
-        return results
+        assert self._dense_coordinator is not None
+        return await self._dense_coordinator.embed_many(chunks)
+
+    async def aclose(self) -> None:
+        """Release background resources — cancels the dense-embedding
+        coordinator's worker task, if one was ever started. Idempotent; safe
+        to call even if ``configure()`` was never called or ``dense`` isn't
+        configured."""
+        if self._dense_coordinator is not None:
+            await self._dense_coordinator.aclose()
+
+    def get_embed_queue(self) -> "asyncio.Queue[EmbedWorkItem] | None":
+        """Return the dense-embedding coordinator's current queue, or None if
+        dense embedding isn't configured, or no work has been submitted yet
+        and set_embed_queue() was never called. See
+        EmbeddingBatchCoordinator.get_queue()."""
+        if self._dense_coordinator is None:
+            return None
+        return self._dense_coordinator.get_queue()
+
+    async def set_embed_queue(self, queue: "asyncio.Queue[EmbedWorkItem]") -> None:
+        """Replace the dense-embedding coordinator's queue — see
+        EmbeddingBatchCoordinator.set_queue() for the safe-swap semantics
+        (migrates not-yet-claimed items, stops and restarts the worker).
+
+        Raises NotConfiguredError if dense embedding isn't configured."""
+        if self._dense_coordinator is None:
+            raise NotConfiguredError("Dense embedding isn't configured — nothing to set a queue on.")
+        await self._dense_coordinator.set_queue(queue)
 
     async def _embed_in_batches_sparse(self, chunks: list[str]) -> list[dict[str, float]]:
         results: list[dict[str, float]] = []

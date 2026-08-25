@@ -37,6 +37,7 @@ _logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from chatbot_plugin_sdk.processors.ingest import IngestProcessor
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
+from chatbot_plugin_sdk.batching import EmbeddingBatchCoordinator, EmbedWorkItem, QueueFactory
 from chatbot_plugin_sdk.backends.async_pg import AsyncPgBackend
 from chatbot_plugin_sdk.backends.sync_pg import SyncPgBackend
 from chatbot_plugin_sdk.backends.base import DatabaseBackend, SearchRow
@@ -76,6 +77,10 @@ __all__ = [
     # Processors
     "IngestProcessor",
     "RetrieveProcessor",
+    # Embedding batch coordination
+    "EmbeddingBatchCoordinator",
+    "EmbedWorkItem",
+    "QueueFactory",
     # Backends
     "AsyncPgBackend",
     "SyncPgBackend",

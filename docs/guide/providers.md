@@ -123,6 +123,29 @@ except RateLimitExhausted:
     logger.warning("Daily embedding quota exhausted — skipping article")
 ```
 
+## Concurrent Ingestion and Batching
+
+If your application calls `IngestProcessor.ingest()` concurrently — e.g. several articles being processed in parallel, all sharing the same `IngestProcessor` instance — every concurrent call's chunks are coordinated through one shared queue and a single background worker (`EmbeddingBatchCoordinator`, see [Batching](../api/batching.md)) rather than each call independently dispatching its own batches. This matters most alongside a rate-limited provider: without coordination, concurrent callers' batches collide on the same per-minute budget, and a caller with unusually large input (many more chunks than `embed_batch_size`) can starve — or be starved by — other concurrent callers.
+
+```python
+processor.configure(
+    backend=backend,
+    dense=dense_provider,
+    embed_batch_size=32,  # max chunks per real dense.embed() call
+)
+
+# Safe to run concurrently on the same `processor` — their chunks share one
+# coordinated dispatch instead of racing each other against the rate limit.
+await asyncio.gather(*(
+    processor.ingest(full_text=text, articles_column_values={"url": url})
+    for text, url in articles
+))
+
+await processor.aclose()  # stop the background worker when the run is done
+```
+
+If you never call `ingest()` concurrently on the same processor, this is invisible — you get the same effective sequential batching as before.
+
 ## Custom Provider
 
 Implement either Protocol to use your own embedding logic:
