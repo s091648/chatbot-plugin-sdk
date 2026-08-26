@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from chatbot_plugin_sdk import RateLimitExhausted, SlidingWindowStrategy
-from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
+from chatbot_plugin_sdk.rate_limit import RateLimitStrategy, estimate_tokens
 
 
 # ── Protocol conformance ────────────────────────────────────────────────────────
@@ -173,3 +173,72 @@ class TestNoLimit:
             for _ in range(100):
                 await strategy.acquire(99999)
         mock_sleep.assert_not_called()
+
+
+# ── estimate_tokens() ────────────────────────────────────────────────────────────
+
+class TestEstimateTokens:
+    def test_estimates_four_chars_per_token(self):
+        assert estimate_tokens(["a" * 400]) == 100
+
+    def test_sums_across_multiple_texts(self):
+        assert estimate_tokens(["a" * 40, "b" * 60]) == 25
+
+    def test_never_returns_zero_for_nonempty_input(self):
+        assert estimate_tokens(["a"]) == 1
+
+    def test_empty_list_returns_one(self):
+        assert estimate_tokens([]) == 1
+
+
+# ── headroom() — non-blocking peek, doesn't claim anything ─────────────────────
+
+class TestHeadroom:
+    def test_disabled_dimensions_report_infinite_headroom(self):
+        strategy = SlidingWindowStrategy(rpm=0, tpm=0)
+        remaining_units, remaining_tokens = strategy.headroom()
+        assert remaining_units == float("inf")
+        assert remaining_tokens == float("inf")
+
+    def test_fresh_window_reports_full_capacity(self):
+        strategy = SlidingWindowStrategy(rpm=100, tpm=30_000)
+        remaining_units, remaining_tokens = strategy.headroom()
+        assert remaining_units == 100
+        assert remaining_tokens == 30_000
+
+    def test_reflects_usage_already_claimed_via_acquire(self):
+        strategy = SlidingWindowStrategy(rpm=100, tpm=30_000)
+        strategy._compute_wait(estimated_tokens=12_000, request_units=96)
+        remaining_units, remaining_tokens = strategy.headroom()
+        assert remaining_units == 4
+        assert remaining_tokens == 18_000
+
+    def test_does_not_claim_any_slot(self):
+        """headroom() is a pure peek — calling it repeatedly must not change
+        what it reports, unlike acquire()/_compute_wait() which claim a slot
+        on success."""
+        strategy = SlidingWindowStrategy(rpm=100, tpm=30_000)
+        first = strategy.headroom()
+        second = strategy.headroom()
+        assert first == second == (100, 30_000)
+
+    def test_ignores_rpd_entirely(self):
+        """rpd is a whole-run hard cap enforced by acquire() raising
+        RateLimitExhausted, not a per-batch sizing signal — headroom() must
+        not reflect it even when the daily cap is already exhausted."""
+        strategy = SlidingWindowStrategy(rpm=100, tpm=30_000, rpd=1)
+        strategy._daily_count = 1  # already at the daily cap
+        remaining_units, remaining_tokens = strategy.headroom()
+        assert remaining_units == 100
+        assert remaining_tokens == 30_000
+
+    def test_evicts_stale_entries_before_reporting(self):
+        strategy = SlidingWindowStrategy(rpm=100, tpm=30_000)
+        strategy._compute_wait(estimated_tokens=12_000, request_units=96)
+        # Backdate the claimed window entries past the 60s sliding window.
+        stale_time = time.monotonic() - 61
+        strategy._rpm_window = deque([(stale_time, 96)])
+        strategy._tpm_window = deque([(stale_time, 12_000)])
+        remaining_units, remaining_tokens = strategy.headroom()
+        assert remaining_units == 100
+        assert remaining_tokens == 30_000

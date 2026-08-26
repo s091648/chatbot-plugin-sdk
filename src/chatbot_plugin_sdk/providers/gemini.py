@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.protocols import Tracer, default_tracer
-from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
@@ -188,13 +188,45 @@ class GeminiDenseProvider:
         self._daily_exhausted = False
         self._tracer: Tracer = tracer or default_tracer(__name__)
 
-    def _embed_sync(self, texts: list[str]) -> list[list[float]]:
+    @property
+    def rate_limit(self) -> "RateLimitStrategy | None":
+        """Public read access to the configured rate limiter — lets a caller
+        like EmbeddingBatchCoordinator query current headroom (via
+        ``rate_limit.headroom()``) before forming a batch, without the
+        coordinator needing to know this is a Gemini provider specifically."""
+        return self._rate_limit
+
+    def _embed_sync(self, texts: list[str]) -> "tuple[list[list[float]], int | None]":
         response = self._client.models.embed_content(
             model=self._model,
             contents=texts,
             config={"task_type": "CLASSIFICATION", "output_dimensionality": self.dimension},
         )
-        return [list(e.values) for e in response.embeddings]
+        vectors = [list(e.values) for e in response.embeddings]
+        return vectors, self._extract_actual_tokens(response)
+
+    @staticmethod
+    def _extract_actual_tokens(response) -> "int | None":
+        """Sum Google's own real per-chunk token count
+        (``EmbedContentResponse.embeddings[i].statistics.token_count``) when
+        every embedding in the response carries one, so a successful call can
+        feed ``rate_limit.record_usage()`` the real figure instead of leaving
+        the TPM window holding ``estimate_tokens()``'s chars/4 approximation
+        for that call indefinitely. Returns ``None`` (skip the correction,
+        don't guess) if the field is absent on any embedding — API version
+        drift or a mocked/partial response must not silently record a
+        misleading total."""
+        embeddings = getattr(response, "embeddings", None) or []
+        if not embeddings:
+            return None
+        counts: list[int] = []
+        for e in embeddings:
+            stats = getattr(e, "statistics", None)
+            token_count = getattr(stats, "token_count", None) if stats is not None else None
+            if token_count is None:
+                return None
+            counts.append(token_count)
+        return sum(counts)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if self._daily_exhausted:
@@ -223,15 +255,17 @@ class GeminiDenseProvider:
             "gemini_dense.embed", attributes={"model": self._model, "text_count": len(texts)},
         ) as span:
             if self._rate_limit is not None:
-                estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+                estimated_tokens = estimate_tokens(texts)
                 await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
                 span.add_event("rate_limit_acquired")
 
             loop = asyncio.get_event_loop()
             for attempt in range(self._max_retries):
                 try:
-                    result = await loop.run_in_executor(None, self._embed_sync, texts)
+                    result, actual_tokens = await loop.run_in_executor(None, self._embed_sync, texts)
                     span.add_event("embed_sync_done")
+                    if self._rate_limit is not None and actual_tokens is not None:
+                        self._rate_limit.record_usage(actual_tokens)
                     return result
                 except Exception as exc:
                     if not _is_quota_error(exc):

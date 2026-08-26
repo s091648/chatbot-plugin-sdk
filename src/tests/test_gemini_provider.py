@@ -166,7 +166,7 @@ class TestEmbedRetryBehavior:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RPM_EXC
-            return [[0.1] * 768 for _ in texts]
+            return [[0.1] * 768 for _ in texts], None
 
         with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -185,7 +185,7 @@ class TestEmbedRetryBehavior:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise TPM_EXC
-            return [[0.1] * 768 for _ in texts]
+            return [[0.1] * 768 for _ in texts], None
 
         with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -203,7 +203,7 @@ class TestEmbedRetryBehavior:
             seen_batches.append(list(texts))
             if len(texts) > 2:
                 raise TPM_EXC
-            return [[0.5] * 768 for _ in texts]
+            return [[0.5] * 768 for _ in texts], None
 
         with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -228,7 +228,7 @@ class TestEmbedRetryBehavior:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise TPM_EXC
-            return [[0.1] * 768]
+            return [[0.1] * 768], None
 
         with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -250,7 +250,7 @@ class TestEmbedRetryBehavior:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise no_delay_exc
-            return [[0.1] * 768 for _ in texts]
+            return [[0.1] * 768 for _ in texts], None
 
         with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
@@ -289,3 +289,96 @@ class TestEmbedRetryBehavior:
             with pytest.raises(RateLimitExhausted, match="after 2 retries"):
                 await provider.embed(["a"])
         mock_sleep.assert_awaited_once_with(5.0)
+
+
+# ── Real token-usage feedback (_extract_actual_tokens / record_usage) ──────────
+
+def _fake_response(token_counts):
+    """Builds a fake EmbedContentResponse-shaped object: one embedding per
+    entry in token_counts, each carrying that entry as
+    embeddings[i].statistics.token_count. Pass None for an entry to simulate
+    a missing/absent statistics field on that one embedding."""
+
+    class _Stats:
+        def __init__(self, token_count):
+            self.token_count = token_count
+
+    class _Embedding:
+        def __init__(self, token_count):
+            self.values = [0.1, 0.2, 0.3]
+            self.statistics = _Stats(token_count) if token_count is not None else None
+
+    class _Response:
+        def __init__(self, counts):
+            self.embeddings = [_Embedding(c) for c in counts]
+
+    return _Response(token_counts)
+
+
+class TestExtractActualTokens:
+    def test_sums_token_count_across_all_embeddings(self):
+        response = _fake_response([10, 20, 5])
+        assert GeminiDenseProvider._extract_actual_tokens(response) == 35
+
+    def test_none_when_any_embedding_has_no_statistics(self):
+        response = _fake_response([10, None, 5])
+        assert GeminiDenseProvider._extract_actual_tokens(response) is None
+
+    def test_none_when_embeddings_list_is_empty(self):
+        response = _fake_response([])
+        assert GeminiDenseProvider._extract_actual_tokens(response) is None
+
+    def test_none_when_response_has_no_embeddings_attribute(self):
+        assert GeminiDenseProvider._extract_actual_tokens(object()) is None
+
+
+class TestRecordUsageFeedback:
+    @pytest.mark.asyncio
+    async def test_record_usage_called_with_real_token_count_on_success(self):
+        strategy = AsyncMock()
+        strategy.acquire = AsyncMock()
+        strategy.record_usage = MagicMock()
+        provider = _make_provider(rate_limit=strategy)
+        with patch.object(provider, "_embed_sync", return_value=([[0.1, 0.2, 0.3]], 42)):
+            await provider.embed(["a"])
+        strategy.record_usage.assert_called_once_with(42)
+
+    @pytest.mark.asyncio
+    async def test_record_usage_skipped_when_actual_tokens_is_none(self):
+        # e.g. the response was missing statistics — must not record a guess.
+        strategy = AsyncMock()
+        strategy.acquire = AsyncMock()
+        strategy.record_usage = MagicMock()
+        provider = _make_provider(rate_limit=strategy)
+        with patch.object(provider, "_embed_sync", return_value=([[0.1, 0.2, 0.3]], None)):
+            await provider.embed(["a"])
+        strategy.record_usage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_record_usage_skipped_when_no_rate_limit_configured(self):
+        provider = _make_provider(rate_limit=None)
+        with patch.object(provider, "_embed_sync", return_value=([[0.1, 0.2, 0.3]], 42)):
+            result = await provider.embed(["a"])
+        assert result == [[0.1, 0.2, 0.3]]
+
+    @pytest.mark.asyncio
+    async def test_not_called_on_a_failed_attempt_that_is_later_retried(self):
+        strategy = AsyncMock()
+        strategy.acquire = AsyncMock()
+        strategy.record_usage = MagicMock()
+        provider = _make_provider(max_retries=3, rate_limit=strategy)
+        calls = {"n": 0}
+
+        def fake_embed_sync(texts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RPM_EXC
+            return [[0.1] * 768 for _ in texts], 17
+
+        with patch.object(provider, "_embed_sync", side_effect=fake_embed_sync), \
+             patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock):
+            await provider.embed(["a"])
+
+        # Only the successful (2nd) attempt's real count is recorded — the
+        # rejected 1st attempt never charged real tokens, so nothing to record.
+        strategy.record_usage.assert_called_once_with(17)
