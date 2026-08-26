@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+from chatbot_plugin_sdk.rate_limit import estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
@@ -56,6 +57,12 @@ class HuggingFaceDenseProvider:
         self._timeout = timeout
         self._url = f"{_HF_INFERENCE_BASE}/{model}"
 
+    @property
+    def rate_limit(self) -> "RateLimitStrategy | None":
+        """Public read access to the configured rate limiter — see
+        GeminiDenseProvider.rate_limit for why this is exposed."""
+        return self._rate_limit
+
     def _build_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             headers={"Authorization": f"Bearer {self._api_token}"},
@@ -64,7 +71,7 @@ class HuggingFaceDenseProvider:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if self._rate_limit is not None:
-            estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+            estimated_tokens = estimate_tokens(texts)
             await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
 
         payload = {"inputs": texts, "options": {"wait_for_model": True}}

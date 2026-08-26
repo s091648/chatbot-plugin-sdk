@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.protocols import Tracer, default_tracer
-from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
@@ -188,6 +188,14 @@ class GeminiDenseProvider:
         self._daily_exhausted = False
         self._tracer: Tracer = tracer or default_tracer(__name__)
 
+    @property
+    def rate_limit(self) -> "RateLimitStrategy | None":
+        """Public read access to the configured rate limiter — lets a caller
+        like EmbeddingBatchCoordinator query current headroom (via
+        ``rate_limit.headroom()``) before forming a batch, without the
+        coordinator needing to know this is a Gemini provider specifically."""
+        return self._rate_limit
+
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         response = self._client.models.embed_content(
             model=self._model,
@@ -223,7 +231,7 @@ class GeminiDenseProvider:
             "gemini_dense.embed", attributes={"model": self._model, "text_count": len(texts)},
         ) as span:
             if self._rate_limit is not None:
-                estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+                estimated_tokens = estimate_tokens(texts)
                 await self._rate_limit.acquire(estimated_tokens, request_units=len(texts))
                 span.add_event("rate_limit_acquired")
 

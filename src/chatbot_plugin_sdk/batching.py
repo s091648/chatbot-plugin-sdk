@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+from chatbot_plugin_sdk.rate_limit import estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider
@@ -41,6 +42,25 @@ class EmbeddingBatchCoordinator:
     serialize on it — one worker avoids wasted, uncoordinated collisions
     between concurrent callers by construction, rather than merely reducing
     their frequency.
+
+    Batch formation is rate-limit-aware when ``dense`` exposes a ``rate_limit``
+    attribute whose value has a ``headroom()`` method (``SlidingWindowStrategy``
+    does; see its docstring) — the worker stops growing a batch as soon as the
+    next item would exceed the *currently available* RPM/TPM window, instead
+    of always growing to ``embed_batch_size`` and letting the provider's
+    ``acquire()`` block on the whole thing. This matters specifically for TPM:
+    without it, a batch sized purely by item count can sit right at the edge
+    of (or past) the real per-minute token budget on every single call —
+    small, unavoidable error in the token estimate (``estimate_tokens()`` is a
+    4-chars-≈-1-token approximation, not a real tokenizer) then reliably tips
+    real upstream usage over Google's actual quota even though the local
+    estimate looked fine, producing recurring 429s despite locally-configured
+    RPM/TPM matching the real quota. Right-sizing against live headroom
+    shrinks the blast radius of that estimation error instead of eliminating
+    it — ``acquire()`` remains the authoritative, blocking gate either way.
+    When ``dense`` has no ``rate_limit`` (or that limiter has no
+    ``headroom()``), batch formation falls back to the original count-only
+    behavior.
 
     ``queue_factory`` is a pure dependency-inversion seam (DIP) — pass one
     to control queue behavior (bounded, priority-ordered, instrumented,
@@ -95,18 +115,63 @@ class EmbeddingBatchCoordinator:
             await self._queue.put(item)
         return list(await asyncio.gather(*(item.future for item in items)))
 
+    def _headroom_fn(self):
+        """Return the dense provider's rate limiter's headroom() bound method,
+        or None if unavailable — either the provider exposes no rate_limit at
+        all (e.g. FastEmbedDenseProvider, a local model with no upstream
+        quota), or its rate_limit has no headroom() method (a custom
+        RateLimitStrategy implementation that predates this). None means
+        "fall back to count-only batching", not "unlimited"."""
+        rate_limit = getattr(self._dense, "rate_limit", None)
+        if rate_limit is None:
+            return None
+        return getattr(rate_limit, "headroom", None)
+
     async def _worker_loop(self) -> None:
         assert self._queue is not None
         current_batch: "Optional[List[EmbedWorkItem]]" = None
+        # An item already popped off the queue while probing whether it fits
+        # in the batch being formed, but that didn't fit and wasn't part of
+        # any dispatched batch yet — becomes the next batch's first item.
+        # Holding it here (rather than queue.put_nowait()'ing it back) keeps
+        # strict FIFO order: put_nowait() would append it behind whatever
+        # else is currently queued instead of leaving it at the front.
+        pending: "Optional[EmbedWorkItem]" = None
         try:
             while True:
-                item = await self._queue.get()
+                if pending is not None:
+                    item, pending = pending, None
+                else:
+                    item = await self._queue.get()
                 batch = [item]
-                while len(batch) < self._embed_batch_size:
-                    try:
-                        batch.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
+                headroom_fn = self._headroom_fn()
+                if headroom_fn is not None:
+                    remaining_units, remaining_tokens = headroom_fn()
+                    running_tokens = estimate_tokens([item.text])
+                    while len(batch) < self._embed_batch_size:
+                        try:
+                            next_item = self._queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        next_tokens = estimate_tokens([next_item.text])
+                        if (
+                            len(batch) + 1 > remaining_units
+                            or running_tokens + next_tokens > remaining_tokens
+                        ):
+                            # Doesn't fit the window available right now — save it
+                            # for the next batch rather than blocking this one on
+                            # its acquire() wait too. The first item of a batch is
+                            # never gated this way, so a batch is never empty.
+                            pending = next_item
+                            break
+                        batch.append(next_item)
+                        running_tokens += next_tokens
+                else:
+                    while len(batch) < self._embed_batch_size:
+                        try:
+                            batch.append(self._queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
                 current_batch = batch  # tracked so a cancellation mid-embed() can still resolve it
                 texts = [b.text for b in batch]
                 try:
@@ -141,6 +206,8 @@ class EmbeddingBatchCoordinator:
                 for b in current_batch:
                     if not b.future.done():
                         b.future.cancel()
+            if pending is not None and not pending.future.done():
+                pending.future.cancel()
             while True:
                 try:
                     leftover = self._queue.get_nowait()

@@ -27,6 +27,37 @@ def _dense(embed_side_effect=None):
     return _Dense()
 
 
+def _dense_with_rate_limit(headroom_sequence, embed_side_effect=None):
+    """A DenseEmbeddingProvider stub whose ``rate_limit.headroom()`` returns
+    each entry of ``headroom_sequence`` in turn (the last entry repeats once
+    exhausted) — lets a test script exactly what budget the worker sees each
+    time it forms a batch, without a real SlidingWindowStrategy's timing."""
+
+    class _RateLimit:
+        def __init__(self):
+            self.calls = 0
+
+        def headroom(self):
+            idx = min(self.calls, len(headroom_sequence) - 1)
+            self.calls += 1
+            return headroom_sequence[idx]
+
+    class _Dense:
+        dimension = 3
+        rate_limit = _RateLimit()
+
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        async def embed(self, texts):
+            self.calls.append(list(texts))
+            if embed_side_effect is not None:
+                return await embed_side_effect(texts)
+            return [[0.1, 0.2, 0.3] for _ in texts]
+
+    return _Dense()
+
+
 # ── Single-caller behavior (parity with the pre-coordinator sequential loop) ───
 
 class TestSingleCaller:
@@ -279,3 +310,91 @@ class TestAclose:
         await coordinator.embed_many(["a"])
         await coordinator.aclose()
         await coordinator.aclose()  # must not raise
+
+
+# ── Headroom-aware batch formation ──────────────────────────────────────────────
+
+class TestHeadroomAwareBatching:
+    @pytest.mark.asyncio
+    async def test_batch_shrinks_to_available_rpm_headroom(self):
+        # rpm headroom = 2 request units; every 1-char text costs 1 unit.
+        dense = _dense_with_rate_limit([(2, 100)])
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        vectors = await coordinator.embed_many(["a", "b", "c", "d", "e"])
+        assert len(vectors) == 5
+        # 5 items split 2/2/1 instead of one embed_batch_size=16 call — FIFO
+        # order preserved across the split.
+        assert dense.calls == [["a", "b"], ["c", "d"], ["e"]]
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_shrinks_to_available_tpm_headroom(self):
+        # tpm headroom = 3 tokens. "cccccccc" (8 chars) estimates to 2 tokens,
+        # every 4-char text to 1 — an unequal-weight case count-only batching
+        # can't express.
+        dense = _dense_with_rate_limit([(100, 3)])
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        vectors = await coordinator.embed_many(["aaaa", "bbbb", "cccccccc", "dddd"])
+        assert len(vectors) == 4
+        assert dense.calls == [["aaaa", "bbbb"], ["cccccccc", "dddd"]]
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_first_item_never_blocked_by_zero_headroom(self):
+        """A batch is never left empty — the first item is always included
+        even when headroom() reports nothing available. acquire() (not this
+        pre-check) remains the actual blocking gate for that case."""
+        dense = _dense_with_rate_limit([(0, 0)])
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        vectors = await coordinator.embed_many(["a"])
+        assert vectors == [[0.1, 0.2, 0.3]]
+        assert dense.calls == [["a"]]
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_unlimited_headroom_behaves_like_count_only_batching(self):
+        dense = _dense_with_rate_limit([(float("inf"), float("inf"))])
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        vectors = await coordinator.embed_many(["a", "b", "c"])
+        assert len(vectors) == 3
+        assert dense.calls == [["a", "b", "c"]]
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_count_only_when_dense_has_no_rate_limit_attr(self):
+        """Plain _dense() stub (no rate_limit attribute at all) — e.g. a
+        FastEmbedDenseProvider with no upstream quota — must behave exactly
+        as before this change."""
+        dense = _dense()
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=2)
+        vectors = await coordinator.embed_many(["a", "b", "c"])
+        assert len(vectors) == 3
+        assert dense.calls == [["a", "b"], ["c"]]
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_count_only_when_rate_limit_lacks_headroom(self):
+        """A rate_limit object without a headroom() method (a custom
+        RateLimitStrategy implementation predating this feature) must not
+        crash the worker — falls back to count-only batching."""
+
+        class _RateLimitWithoutHeadroom:
+            pass
+
+        class _Dense:
+            dimension = 3
+            rate_limit = _RateLimitWithoutHeadroom()
+
+            def __init__(self):
+                self.calls: list[list[str]] = []
+
+            async def embed(self, texts):
+                self.calls.append(list(texts))
+                return [[0.1, 0.2, 0.3] for _ in texts]
+
+        dense = _Dense()
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=2)
+        vectors = await coordinator.embed_many(["a", "b", "c"])
+        assert len(vectors) == 3
+        assert dense.calls == [["a", "b"], ["c"]]
+        await coordinator.aclose()

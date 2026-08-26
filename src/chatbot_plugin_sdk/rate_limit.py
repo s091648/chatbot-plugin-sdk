@@ -23,6 +23,15 @@ from typing import Protocol, runtime_checkable
 from chatbot_plugin_sdk.exceptions import ExternalDependencyError
 
 
+def estimate_tokens(texts: list[str]) -> int:
+    """Rough token estimate shared by every rate-limited provider (4 chars ≈
+    1 token — same approximation SlidingWindowStrategy's docstring already
+    assumes). Also used by EmbeddingBatchCoordinator to right-size a batch
+    against SlidingWindowStrategy.headroom() before dispatching it, instead
+    of sizing batches purely by item count."""
+    return max(1, sum(len(t) for t in texts) // 4)
+
+
 class RateLimitExhausted(ExternalDependencyError):
     """Raised when a provider's request cap (local rpd, or the upstream
     API's own quota) is reached and won't recover within this run.
@@ -120,6 +129,36 @@ class SlidingWindowStrategy:
             if self._tpm_window:
                 self._tpm_window.pop()
             self._tpm_window.append((now, actual_tokens))
+
+    def headroom(self) -> tuple[float, float]:
+        """Non-blocking peek at how much RPM/TPM capacity is available right
+        now, without claiming any of it (unlike ``acquire()``).
+
+        Returns ``(remaining_request_units, remaining_tokens)``. A disabled
+        dimension (``rpm``/``tpm`` == 0) reports ``float("inf")`` for that
+        slot, matching ``acquire()``'s "0 disables this limit" contract.
+
+        Deliberately ignores ``rpd`` — that's a whole-run hard cap enforced
+        by ``acquire()`` raising :exc:`RateLimitExhausted`, not a per-batch
+        sizing concern. Intended for callers like
+        :class:`~chatbot_plugin_sdk.batching.EmbeddingBatchCoordinator` that
+        want to size a batch to what's actually available in the current
+        60s window *before* calling ``acquire()``, rather than forming a
+        batch by item count alone and finding out only at ``acquire()``
+        time that it must wait for the whole thing.
+        """
+        with self._lock:
+            now = time.monotonic()
+            self._evict_stale(now)
+            remaining_units: float = float("inf")
+            if self.rpm > 0:
+                used = sum(u for _, u in self._rpm_window)
+                remaining_units = max(0, self.rpm - used)
+            remaining_tokens: float = float("inf")
+            if self.tpm > 0:
+                used = sum(t for _, t in self._tpm_window)
+                remaining_tokens = max(0, self.tpm - used)
+            return remaining_units, remaining_tokens
 
     # ── internals ──────────────────────────────────────────────────────────
 

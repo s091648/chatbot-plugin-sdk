@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 import httpx
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+from chatbot_plugin_sdk.rate_limit import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,12 @@ class EndpointProvider:
         self._retry_delay = retry_delay
         self.dimension: int = dimension or 0  # sparse 時為 0（不使用）
 
+    @property
+    def rate_limit(self) -> "RateLimitStrategy | None":
+        """Public read access to the configured rate limiter — see
+        GeminiDenseProvider.rate_limit for why this is exposed."""
+        return self._rate_limit
+
     def _build_client(self) -> httpx.AsyncClient:
         headers: dict[str, str] = {}
         if self._api_key:
@@ -84,7 +91,7 @@ class EndpointProvider:
         # Estimate tokens: rough approximation (4 chars ≈ 1 token)
         _estimated_tokens = 0
         if self._rate_limit is not None:
-            _estimated_tokens = max(1, sum(len(t) for t in texts) // 4)
+            _estimated_tokens = estimate_tokens(texts)
             await self._rate_limit.acquire(_estimated_tokens, request_units=len(texts))
 
         logger.debug(
