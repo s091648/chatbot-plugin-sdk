@@ -7,6 +7,7 @@ import pytest
 
 from chatbot_plugin_sdk import EmbeddingBatchCoordinator
 from chatbot_plugin_sdk.exceptions import EmbeddingError
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
 
 
 def _dense(embed_side_effect=None):
@@ -161,6 +162,72 @@ class TestBatchFailure:
         coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
         with pytest.raises(RuntimeError):
             await coordinator.embed_many(["a"])
+        vectors = await coordinator.embed_many(["b"])
+        assert vectors == [[0.1, 0.2, 0.3]]
+        assert coordinator._fatal_exc is None  # a plain error must NOT latch the coordinator
+        await coordinator.aclose()
+
+
+# ── RateLimitExhausted (daily-quota RPD) circuit breaker ───────────────────────
+
+class TestRateLimitCircuitBreaker:
+    @pytest.mark.asyncio
+    async def test_rate_limit_exhausted_latches_and_fails_backlog_without_re_calling_embed(self):
+        """Once a provider call reports the daily cap is spent, the coordinator
+        must stop calling embed() and fail every other queued/incoming item
+        with the same error — not keep pulling one batch at a time and
+        re-hitting the wall (which is what left every article failing after
+        minutes of shared-queue wait in production)."""
+        async def _rpd_spent(texts):
+            raise RateLimitExhausted("Daily request cap of 1000 reached.")
+
+        dense = _dense(embed_side_effect=_rpd_spent)
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=1)
+
+        results = await asyncio.gather(
+            *(coordinator.embed_many([f"chunk-{i}"]) for i in range(20)),
+            return_exceptions=True,
+        )
+        assert all(isinstance(r, RateLimitExhausted) for r in results)
+        # The whole backlog failed off ONE real attempt (maybe two on a race),
+        # never 20.
+        assert len(dense.calls) <= 2
+        assert coordinator._fatal_exc is not None
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_embed_many_after_latch_raises_immediately_without_enqueuing(self):
+        async def _rpd_spent(texts):
+            raise RateLimitExhausted("Daily request cap reached.")
+
+        dense = _dense(embed_side_effect=_rpd_spent)
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        with pytest.raises(RateLimitExhausted):
+            await coordinator.embed_many(["a"])
+        calls_after_first = len(dense.calls)
+
+        with pytest.raises(RateLimitExhausted):
+            await coordinator.embed_many(["b", "c"])
+        assert len(dense.calls) == calls_after_first  # no new provider call, nothing enqueued
+        await coordinator.aclose()
+
+    @pytest.mark.asyncio
+    async def test_reset_clears_the_latch(self):
+        calls = {"n": 0}
+
+        async def _rpd_then_ok(texts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RateLimitExhausted("Daily request cap reached.")
+            return [[0.1, 0.2, 0.3] for _ in texts]
+
+        dense = _dense(embed_side_effect=_rpd_then_ok)
+        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        with pytest.raises(RateLimitExhausted):
+            await coordinator.embed_many(["a"])
+
+        coordinator.reset()
+        assert coordinator._fatal_exc is None
         vectors = await coordinator.embed_many(["b"])
         assert vectors == [[0.1, 0.2, 0.3]]
         await coordinator.aclose()

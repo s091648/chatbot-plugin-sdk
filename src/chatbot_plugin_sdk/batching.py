@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
-from chatbot_plugin_sdk.rate_limit import estimate_tokens
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider
@@ -62,6 +62,18 @@ class EmbeddingBatchCoordinator:
     ``headroom()``), batch formation falls back to the original count-only
     behavior.
 
+    **Daily-quota (RPD) circuit breaker.** When a provider call raises
+    :exc:`~chatbot_plugin_sdk.rate_limit.RateLimitExhausted` — its request
+    cap for the run is spent and, by that exception's contract, won't
+    recover — the coordinator *latches*: it fails the current batch, then
+    immediately drains and fails every other item still queued (rather than
+    letting the worker keep pulling batches and calling ``embed()`` again,
+    each of which would just re-raise after every caller has already waited
+    its turn in the shared queue). While latched, new :meth:`embed_many`
+    calls re-raise that same exception up front without enqueuing anything.
+    Call :meth:`reset` (or :meth:`set_queue`, which resets it) to clear the
+    latch for a fresh run; a brand-new coordinator starts unlatched.
+
     ``queue_factory`` is a pure dependency-inversion seam (DIP) — pass one
     to control queue behavior (bounded, priority-ordered, instrumented,
     etc.); the coordinator only ever calls the standard ``asyncio.Queue``
@@ -89,6 +101,11 @@ class EmbeddingBatchCoordinator:
         self._queue_factory: QueueFactory = queue_factory or (lambda: asyncio.Queue())
         self._queue: "asyncio.Queue[EmbedWorkItem] | None" = None
         self._worker_task: "asyncio.Task[None] | None" = None
+        # Set to the RateLimitExhausted instance once a provider call reports
+        # the run's request cap is spent — latches the whole coordinator so
+        # every remaining/incoming item fails fast with it instead of each
+        # re-hitting the same wall. Cleared by reset()/set_queue().
+        self._fatal_exc: "BaseException | None" = None
 
     def _ensure_started(self) -> None:
         if self._queue is None:
@@ -107,6 +124,10 @@ class EmbeddingBatchCoordinator:
         """
         if not texts:
             return []
+        if self._fatal_exc is not None:
+            # Latched by an earlier RateLimitExhausted — the provider's cap is
+            # spent for this run; don't enqueue work that can only fail.
+            raise self._fatal_exc
         self._ensure_started()
         assert self._queue is not None
         loop = asyncio.get_running_loop()
@@ -127,6 +148,25 @@ class EmbeddingBatchCoordinator:
             return None
         return getattr(rate_limit, "headroom", None)
 
+    def _drain_and_fail(self, exc: "BaseException") -> None:
+        """Empty the queue right now, resolving every remaining item's future
+        with ``exc``. Used once the RateLimitExhausted latch is set — the
+        worker must not keep calling ``embed()`` after that."""
+        assert self._queue is not None
+        while True:
+            try:
+                leftover = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not leftover.future.done():
+                leftover.future.set_exception(exc)
+
+    def reset(self) -> None:
+        """Clear the RateLimitExhausted latch so the coordinator can be
+        reused for a fresh run. A brand-new coordinator is already unlatched;
+        :meth:`set_queue` also resets it."""
+        self._fatal_exc = None
+
     async def _worker_loop(self) -> None:
         assert self._queue is not None
         current_batch: "Optional[List[EmbedWorkItem]]" = None
@@ -143,6 +183,16 @@ class EmbeddingBatchCoordinator:
                     item, pending = pending, None
                 else:
                     item = await self._queue.get()
+
+                if self._fatal_exc is not None:
+                    # Latched: the provider's request cap is spent for this
+                    # run. Fail this item and anything queued behind it now,
+                    # without another embed() call.
+                    if not item.future.done():
+                        item.future.set_exception(self._fatal_exc)
+                    self._drain_and_fail(self._fatal_exc)
+                    continue
+
                 batch = [item]
                 headroom_fn = self._headroom_fn()
                 if headroom_fn is not None:
@@ -191,6 +241,17 @@ class EmbeddingBatchCoordinator:
                         if not b.future.done():
                             b.future.set_exception(exc)
                     current_batch = None
+                    if isinstance(exc, RateLimitExhausted):
+                        # Daily request cap spent — won't recover this run.
+                        # Latch, and fail the rest of the backlog now rather
+                        # than letting the loop keep calling embed() (each
+                        # call re-raises) after every caller already queued.
+                        self._fatal_exc = exc
+                        if pending is not None:
+                            if not pending.future.done():
+                                pending.future.set_exception(exc)
+                            pending = None
+                        self._drain_and_fail(exc)
                     continue
                 for b, vec in zip(batch, vectors):
                     if not b.future.done():
@@ -273,6 +334,9 @@ class EmbeddingBatchCoordinator:
                 pass
 
         self._queue = queue
+        # A new queue means a fresh run's work — don't carry a prior run's
+        # RateLimitExhausted latch onto it.
+        self._fatal_exc = None
 
         if old_worker is not None:
             self._worker_task = asyncio.create_task(self._worker_loop())
