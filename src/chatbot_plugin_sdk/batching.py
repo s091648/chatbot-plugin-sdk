@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
-from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, estimate_tokens
+from chatbot_plugin_sdk.rate_limit import RpdExhausted, estimate_tokens
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider
@@ -63,16 +63,19 @@ class EmbeddingBatchCoordinator:
     behavior.
 
     **Daily-quota (RPD) circuit breaker.** When a provider call raises
-    :exc:`~chatbot_plugin_sdk.rate_limit.RateLimitExhausted` — its request
-    cap for the run is spent and, by that exception's contract, won't
-    recover — the coordinator *latches*: it fails the current batch, then
-    immediately drains and fails every other item still queued (rather than
-    letting the worker keep pulling batches and calling ``embed()`` again,
-    each of which would just re-raise after every caller has already waited
-    its turn in the shared queue). While latched, new :meth:`embed_many`
-    calls re-raise that same exception up front without enqueuing anything.
-    Call :meth:`reset` (or :meth:`set_queue`, which resets it) to clear the
-    latch for a fresh run; a brand-new coordinator starts unlatched.
+    :exc:`~chatbot_plugin_sdk.rate_limit.RpdExhausted` — the *daily* request
+    cap is spent and, unlike its ``RpmExhausted``/``TpmExhausted`` siblings,
+    won't recover within this run — the coordinator *latches*: it fails the
+    current batch, then immediately drains and fails every other item still
+    queued (rather than letting the worker keep pulling batches and calling
+    ``embed()`` again, each of which would just re-raise after every caller
+    has already waited its turn in the shared queue). While latched, new
+    :meth:`embed_many` calls re-raise that same exception up front without
+    enqueuing anything. Any other exception — including ``RpmExhausted``/
+    ``TpmExhausted``, which are expected to self-heal within a minute — fails
+    only its own batch; the coordinator keeps working normally. Call
+    :meth:`reset` (or :meth:`set_queue`, which resets it) to clear the latch
+    for a fresh run; a brand-new coordinator starts unlatched.
 
     ``queue_factory`` is a pure dependency-inversion seam (DIP) — pass one
     to control queue behavior (bounded, priority-ordered, instrumented,
@@ -101,11 +104,13 @@ class EmbeddingBatchCoordinator:
         self._queue_factory: QueueFactory = queue_factory or (lambda: asyncio.Queue())
         self._queue: "asyncio.Queue[EmbedWorkItem] | None" = None
         self._worker_task: "asyncio.Task[None] | None" = None
-        # Set to the RateLimitExhausted instance once a provider call reports
-        # the run's request cap is spent — latches the whole coordinator so
-        # every remaining/incoming item fails fast with it instead of each
-        # re-hitting the same wall. Cleared by reset()/set_queue().
-        self._fatal_exc: "BaseException | None" = None
+        # Set to the RpdExhausted instance once a provider call reports the
+        # run's *daily* request cap is spent — latches the whole coordinator
+        # so every remaining/incoming item fails fast with it instead of each
+        # re-hitting the same wall. NOT set for RpmExhausted/TpmExhausted
+        # (expected to self-heal within a minute — must not kill the whole
+        # run). Cleared by reset()/set_queue().
+        self._fatal_exc: "RpdExhausted | None" = None
 
     def _ensure_started(self) -> None:
         if self._queue is None:
@@ -125,7 +130,7 @@ class EmbeddingBatchCoordinator:
         if not texts:
             return []
         if self._fatal_exc is not None:
-            # Latched by an earlier RateLimitExhausted — the provider's cap is
+            # Latched by an earlier RpdExhausted — the provider's cap is
             # spent for this run; don't enqueue work that can only fail.
             raise self._fatal_exc
         self._ensure_started()
@@ -150,7 +155,7 @@ class EmbeddingBatchCoordinator:
 
     def _drain_and_fail(self, exc: "BaseException") -> None:
         """Empty the queue right now, resolving every remaining item's future
-        with ``exc``. Used once the RateLimitExhausted latch is set — the
+        with ``exc``. Used once the RpdExhausted latch is set — the
         worker must not keep calling ``embed()`` after that."""
         assert self._queue is not None
         while True:
@@ -162,7 +167,7 @@ class EmbeddingBatchCoordinator:
                 leftover.future.set_exception(exc)
 
     def reset(self) -> None:
-        """Clear the RateLimitExhausted latch so the coordinator can be
+        """Clear the RpdExhausted latch so the coordinator can be
         reused for a fresh run. A brand-new coordinator is already unlatched;
         :meth:`set_queue` also resets it."""
         self._fatal_exc = None
@@ -241,8 +246,9 @@ class EmbeddingBatchCoordinator:
                         if not b.future.done():
                             b.future.set_exception(exc)
                     current_batch = None
-                    if isinstance(exc, RateLimitExhausted):
-                        # Daily request cap spent — won't recover this run.
+                    if isinstance(exc, RpdExhausted):
+                        # Daily request cap spent — won't recover this run
+                        # (unlike RpmExhausted/TpmExhausted, which self-heal).
                         # Latch, and fail the rest of the backlog now rather
                         # than letting the loop keep calling embed() (each
                         # call re-raises) after every caller already queued.
@@ -335,7 +341,7 @@ class EmbeddingBatchCoordinator:
 
         self._queue = queue
         # A new queue means a fresh run's work — don't carry a prior run's
-        # RateLimitExhausted latch onto it.
+        # RpdExhausted latch onto it.
         self._fatal_exc = None
 
         if old_worker is not None:

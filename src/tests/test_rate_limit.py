@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chatbot_plugin_sdk import RateLimitExhausted, SlidingWindowStrategy
-from chatbot_plugin_sdk.rate_limit import RateLimitStrategy, estimate_tokens
+from chatbot_plugin_sdk import RateLimitExhausted, RpdExhausted, SlidingWindowStrategy
+from chatbot_plugin_sdk.rate_limit import RateLimitStrategy, RpmExhausted, TpmExhausted, estimate_tokens
 
 
 # ── Protocol conformance ────────────────────────────────────────────────────────
@@ -72,6 +72,18 @@ class TestComputeWait:
             strategy._compute_wait(0)
         with pytest.raises(RateLimitExhausted):
             strategy._compute_wait(0)
+
+    def test_rpd_reached_raises_the_rpd_subclass_specifically(self):
+        """RPM/TPM never raise at all (they wait) — only RPD does, and it must
+        be the typed RpdExhausted (dimension="rpd"), not the plain base class,
+        so callers like EmbeddingBatchCoordinator can circuit-break on it by
+        type without also tripping on a transient RpmExhausted/TpmExhausted."""
+        strategy = SlidingWindowStrategy(rpd=1)
+        strategy._compute_wait(0)
+        with pytest.raises(RpdExhausted) as exc_info:
+            strategy._compute_wait(0)
+        assert exc_info.value.dimension == "rpd"
+        assert not isinstance(exc_info.value, (RpmExhausted, TpmExhausted))
 
     def test_stale_rpm_entries_evicted(self):
         strategy = SlidingWindowStrategy(rpm=2)

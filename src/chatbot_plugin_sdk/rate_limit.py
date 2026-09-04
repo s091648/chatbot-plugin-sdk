@@ -34,13 +34,52 @@ def estimate_tokens(texts: list[str]) -> int:
 
 class RateLimitExhausted(ExternalDependencyError):
     """Raised when a provider's request cap (local rpd, or the upstream
-    API's own quota) is reached and won't recover within this run.
+    API's own quota) is reached.
 
     A leaf of :class:`ExternalDependencyError` — callers who only care that
     "something upstream failed" can catch the parent; callers who want to
     react specifically to rate limiting (back off, rotate to a different
     provider/key, or abort this run) should catch this class by name.
+
+    Three typed subclasses distinguish *which* quota dimension was hit, via
+    the ``dimension`` class attribute (also present as ``"unknown"`` on this
+    base class, so ``exc.dimension`` is always safe to read regardless of
+    which type a caller catches):
+
+    - :class:`RpdExhausted` — the **daily** request cap. Won't recover
+      within this run/process (raised either by ``SlidingWindowStrategy``'s
+      own local ``rpd`` counter, or by a provider like
+      ``GeminiDenseProvider`` detecting Google's real daily-quota 429) — safe
+      for a caller to circuit-break the rest of its work on.
+    - :class:`RpmExhausted` / :class:`TpmExhausted` — per-**minute** request
+      / token caps. ``SlidingWindowStrategy`` itself never raises either of
+      these — RPM/TPM are enforced by making ``acquire()`` wait out the
+      sliding window, not by raising. Only a provider that gives up
+      *retrying* past its own budget (e.g. ``GeminiDenseProvider`` after a
+      429 whose suggested delay is too long, or too many retries) raises
+      these — a single failed call, not a run-wide dead end; do NOT
+      circuit-break a whole run on one of these alone.
+
+    Plain ``RateLimitExhausted`` (this class, directly) covers a 429 whose
+    dimension a provider couldn't determine — treat conservatively, same as
+    RPM/TPM (fail just this call, don't circuit-break).
     """
+    dimension: str = "unknown"
+
+
+class RpdExhausted(RateLimitExhausted):
+    """Daily request cap (RPD) exhausted — see :class:`RateLimitExhausted`."""
+    dimension = "rpd"
+
+
+class RpmExhausted(RateLimitExhausted):
+    """Per-minute request cap (RPM) exhausted — see :class:`RateLimitExhausted`."""
+    dimension = "rpm"
+
+
+class TpmExhausted(RateLimitExhausted):
+    """Per-minute token cap (TPM) exhausted — see :class:`RateLimitExhausted`."""
+    dimension = "tpm"
 
 
 @runtime_checkable
@@ -52,7 +91,8 @@ class RateLimitStrategy(Protocol):
     """
 
     async def acquire(self, estimated_tokens: int = 0, request_units: int = 1) -> None:
-        """Await until a request slot is available.  May raise :exc:`RateLimitExhausted`.
+        """Await until a request slot is available.  May raise :exc:`RpdExhausted`
+        (RPM/TPM are waited out, not raised — see :class:`RateLimitExhausted`).
 
         request_units: How many RPM/RPD units this call consumes — pass
                         ``len(texts)`` when a single call batches multiple
@@ -84,7 +124,7 @@ class SlidingWindowStrategy:
              ``request_units`` (see ``acquire()``), not in number of ``acquire()``
              calls — a single call batching 50 texts consumes 50 units.
         tpm: Max tokens per minute (estimate: 4 chars ≈ 1 token).  ``0`` disables.
-        rpd: Max requests per day.  When reached, :exc:`RateLimitExhausted` is raised.
+        rpd: Max requests per day.  When reached, :exc:`RpdExhausted` is raised.
              ``0`` disables this hard cap.  Also counted in ``request_units``.
 
     Usage::
@@ -139,7 +179,7 @@ class SlidingWindowStrategy:
         slot, matching ``acquire()``'s "0 disables this limit" contract.
 
         Deliberately ignores ``rpd`` — that's a whole-run hard cap enforced
-        by ``acquire()`` raising :exc:`RateLimitExhausted`, not a per-batch
+        by ``acquire()`` raising :exc:`RpdExhausted`, not a per-batch
         sizing concern. Intended for callers like
         :class:`~chatbot_plugin_sdk.batching.EmbeddingBatchCoordinator` that
         want to size a batch to what's actually available in the current
@@ -166,7 +206,7 @@ class SlidingWindowStrategy:
         """Return seconds to sleep, or 0 if a slot is available (and claim it)."""
         with self._lock:
             if self.rpd > 0 and self._daily_count + request_units > self.rpd:
-                raise RateLimitExhausted(
+                raise RpdExhausted(
                     f"Daily request cap of {self.rpd} reached. "
                     "Switch providers or wait until tomorrow."
                 )
