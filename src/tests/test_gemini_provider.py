@@ -13,7 +13,7 @@ from chatbot_plugin_sdk.providers.gemini import (
     _parse_retry_delay,
     _quota_dimension,
 )
-from chatbot_plugin_sdk.rate_limit import RateLimitExhausted
+from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, RpdExhausted, RpmExhausted, TpmExhausted
 
 
 def _quota_exc(quota_id: str, delay: float | None = None) -> Exception:
@@ -120,9 +120,10 @@ class TestEmbedRetryBehavior:
         provider = _make_provider()
         with patch.object(provider, "_embed_sync", side_effect=DAILY_EXC), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="Daily quota"):
+            with pytest.raises(RpdExhausted, match="Daily quota") as exc_info:
                 await provider.embed(["a"])
         mock_sleep.assert_not_called()
+        assert exc_info.value.dimension == "rpd"
 
     @pytest.mark.asyncio
     async def test_daily_quota_latches_and_skips_later_calls_without_api_call(self):
@@ -131,12 +132,12 @@ class TestEmbedRetryBehavior:
         provider = _make_provider()
         mock_embed_sync = MagicMock(side_effect=DAILY_EXC)
         with patch.object(provider, "_embed_sync", mock_embed_sync):
-            with pytest.raises(RateLimitExhausted, match="Daily quota exceeded"):
+            with pytest.raises(RpdExhausted, match="Daily quota exceeded"):
                 await provider.embed(["a"])
 
         assert mock_embed_sync.call_count == 1
 
-        with pytest.raises(RateLimitExhausted, match="already exhausted"):
+        with pytest.raises(RpdExhausted, match="already exhausted"):
             await provider.embed(["b", "c"])
 
         # No further _embed_sync call for the second, already-latched request.
@@ -148,12 +149,12 @@ class TestEmbedRetryBehavior:
         strategy.acquire = AsyncMock()
         provider = _make_provider(rate_limit=strategy)
         with patch.object(provider, "_embed_sync", side_effect=DAILY_EXC):
-            with pytest.raises(RateLimitExhausted):
+            with pytest.raises(RpdExhausted):
                 await provider.embed(["a"])
         strategy.acquire.assert_awaited_once()
 
         strategy.acquire.reset_mock()
-        with pytest.raises(RateLimitExhausted, match="already exhausted"):
+        with pytest.raises(RpdExhausted, match="already exhausted"):
             await provider.embed(["b"])
         strategy.acquire.assert_not_called()
 
@@ -265,9 +266,10 @@ class TestEmbedRetryBehavior:
         no_delay_exc = _quota_exc("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
         with patch.object(provider, "_embed_sync", side_effect=no_delay_exc), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="after 2 retries"):
+            with pytest.raises(RpmExhausted, match="after 2 retries") as exc_info:
                 await provider.embed(["a"])
         mock_sleep.assert_awaited_once_with(15.0)
+        assert exc_info.value.dimension == "rpm"
 
     @pytest.mark.asyncio
     async def test_delay_over_threshold_raises_immediately(self):
@@ -277,18 +279,45 @@ class TestEmbedRetryBehavior:
         )
         with patch.object(provider, "_embed_sync", side_effect=long_delay_exc), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="exceeding the 300.0s threshold"):
+            with pytest.raises(RpmExhausted, match="exceeding the 300.0s threshold"):
                 await provider.embed(["a"])
         mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delay_over_threshold_on_tpm_dimension_raises_tpm_exhausted(self):
+        provider = _make_provider()
+        long_delay_exc = _quota_exc(
+            "GenerateContentInputTokensPerModelPerMinute-FreeTier", delay=301
+        )
+        with patch.object(provider, "_embed_sync", side_effect=long_delay_exc), \
+             patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(TpmExhausted) as exc_info:
+                await provider.embed(["a"])
+        assert exc_info.value.dimension == "tpm"
 
     @pytest.mark.asyncio
     async def test_exhausts_max_retries_then_raises(self):
         provider = _make_provider(max_retries=2)
         with patch.object(provider, "_embed_sync", side_effect=RPM_EXC), \
              patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            with pytest.raises(RateLimitExhausted, match="after 2 retries"):
+            with pytest.raises(RpmExhausted, match="after 2 retries"):
                 await provider.embed(["a"])
         mock_sleep.assert_awaited_once_with(5.0)
+
+    @pytest.mark.asyncio
+    async def test_unknown_dimension_raises_plain_base_class(self):
+        """A 429 whose quotaId can't be classified at all (_quota_dimension
+        returns "unknown") must raise the plain RateLimitExhausted base class
+        — not RpdExhausted, which would incorrectly let a caller like
+        EmbeddingBatchCoordinator circuit-break the whole run on it."""
+        provider = _make_provider(max_retries=1)
+        unknown_exc = Exception("429 Too Many Requests")
+        with patch.object(provider, "_embed_sync", side_effect=unknown_exc), \
+             patch("chatbot_plugin_sdk.providers.gemini.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(RateLimitExhausted) as exc_info:
+                await provider.embed(["a"])
+        assert type(exc_info.value) is RateLimitExhausted
+        assert exc_info.value.dimension == "unknown"
 
 
 # ── Real token-usage feedback (_extract_actual_tokens / record_usage) ──────────

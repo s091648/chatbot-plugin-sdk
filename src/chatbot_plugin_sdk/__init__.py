@@ -70,6 +70,9 @@ from chatbot_plugin_sdk.rate_limit import (
     RateLimitStrategy,
     SlidingWindowStrategy,
     RateLimitExhausted,
+    RpdExhausted,
+    RpmExhausted,
+    TpmExhausted,
 )
 from chatbot_plugin_sdk.rerankers import FastEmbedReranker, Reranker
 
@@ -123,4 +126,7 @@ __all__ = [
     "RateLimitStrategy",
     "SlidingWindowStrategy",
     "RateLimitExhausted",
+    "RpdExhausted",
+    "RpmExhausted",
+    "TpmExhausted",
 ]

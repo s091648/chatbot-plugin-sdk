@@ -7,7 +7,13 @@ from typing import TYPE_CHECKING
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.protocols import Tracer, default_tracer
-from chatbot_plugin_sdk.rate_limit import RateLimitExhausted, estimate_tokens
+from chatbot_plugin_sdk.rate_limit import (
+    RateLimitExhausted,
+    RpdExhausted,
+    RpmExhausted,
+    TpmExhausted,
+    estimate_tokens,
+)
 
 if TYPE_CHECKING:
     from chatbot_plugin_sdk.rate_limit import RateLimitStrategy
@@ -103,6 +109,21 @@ def _quota_dimension(exc: Exception) -> str:
     return "unknown"
 
 
+_DIMENSION_EXC: dict[str, type[RateLimitExhausted]] = {
+    "rpd": RpdExhausted,
+    "rpm": RpmExhausted,
+    "tpm": TpmExhausted,
+}
+
+
+def _exc_for_dimension(dimension: str) -> "type[RateLimitExhausted]":
+    """Map a _quota_dimension() result to the typed exception to raise —
+    RateLimitExhausted itself (the base class) for "unknown", so a 429 whose
+    dimension can't be determined is still treated conservatively (fails
+    just this call, doesn't trip EmbeddingBatchCoordinator's RPD breaker)."""
+    return _DIMENSION_EXC.get(dimension, RateLimitExhausted)
+
+
 class GeminiDenseProvider:
     """Dense embedding provider backed by Google Gemini (google-genai).
 
@@ -112,10 +133,10 @@ class GeminiDenseProvider:
     When Google returns HTTP 429 the provider sleeps for the suggested
     ``retryDelay`` (parsed from the error response) and retries transparently.
     A daily (RPD) quota violation — detected from the ``QuotaFailure`` detail
-    in the error body, not the delay's length — raises ``RateLimitExhausted``
+    in the error body, not the delay's length — raises ``RpdExhausted``
     immediately instead of retrying, since it won't recover within the run.
     The instance also latches: once a daily quota 429 is seen, every later
-    ``embed()`` call in the same process raises ``RateLimitExhausted``
+    ``embed()`` call in the same process raises ``RpdExhausted``
     immediately without making an API call, since Google's daily cap is
     tracked server-side across the whole account/day — it will not clear
     before this process exits. There is deliberately no cross-process
@@ -138,11 +159,14 @@ class GeminiDenseProvider:
     rpd``) says this is expected to clear on its own, so treating "can't
     parse a delay" as fatal would throw away recoverable requests. A delay
     Google *does* supply that exceeds 5 minutes, or repeated 429s past
-    ``max_retries``, are raised as ``RateLimitExhausted`` rather than the raw
-    ``google.genai`` exception, so every quota-exhaustion path is catchable
-    by callers as one type. Any other failure (network error, malformed
-    response, auth failure) is raised as ``EmbeddingError``, never the raw
-    SDK/HTTP exception.
+    ``max_retries``, are raised as the ``RateLimitExhausted`` subclass
+    matching the violated dimension (``RpdExhausted``/``RpmExhausted``/
+    ``TpmExhausted``, or the plain base class if the dimension couldn't be
+    determined) rather than the raw ``google.genai`` exception, so every
+    quota-exhaustion path is catchable by callers as one type — or as a
+    specific dimension, e.g. to circuit-break only on ``RpdExhausted``. Any
+    other failure (network error, malformed response, auth failure) is
+    raised as ``EmbeddingError``, never the raw SDK/HTTP exception.
 
     Args:
         api_key: Gemini API key.
@@ -234,7 +258,7 @@ class GeminiDenseProvider:
                 "gemini_daily_quota_skip",
                 extra={"model": self._model},
             )
-            raise RateLimitExhausted(
+            raise RpdExhausted(
                 f"Daily quota already exhausted for {self._model} this run"
             )
 
@@ -279,7 +303,7 @@ class GeminiDenseProvider:
                             "gemini_daily_quota_exhausted",
                             extra={"model": self._model, "quota_dimension": "rpd"},
                         )
-                        raise RateLimitExhausted(
+                        raise RpdExhausted(
                             f"Daily quota exceeded for {self._model}"
                         ) from exc
 
@@ -312,7 +336,7 @@ class GeminiDenseProvider:
                             "gemini_quota_delay_too_long",
                             extra={"delay": delay, "model": self._model, "quota_dimension": dimension},
                         )
-                        raise RateLimitExhausted(
+                        raise _exc_for_dimension(dimension)(
                             f"Quota exceeded for {self._model} with retry delay {delay}s "
                             f"exceeding the {_MAX_RETRYABLE_DELAY_SECS}s threshold "
                             f"(dimension={dimension})"
@@ -341,7 +365,7 @@ class GeminiDenseProvider:
                                 "quota_dimension": dimension,
                             },
                         )
-                        raise RateLimitExhausted(
+                        raise _exc_for_dimension(dimension)(
                             f"Quota exceeded for {self._model} after {self._max_retries} retries"
                         ) from exc
 
