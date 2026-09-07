@@ -55,6 +55,7 @@ class IngestProcessor:
         self._dense: DenseEmbeddingProvider | None = None
         self._sparse: SparseEmbeddingProvider | None = None
         self._ready: bool = False
+        self._ready_lock: asyncio.Lock = asyncio.Lock()
         self._embed_batch_size: int = 16
         self._chunk_size: int = DEFAULT_CHUNK_SIZE
         self._chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
@@ -104,17 +105,41 @@ class IngestProcessor:
         )
 
     async def _ensure_ready(self) -> None:
-        """Idempotent first-use initialisation — delegates to backend.setup()."""
+        """Idempotent first-use initialisation — delegates to backend.setup().
+
+        Serialised by ``_ready_lock`` so a burst of concurrent first-time
+        ``ingest()`` calls runs ``backend.setup()`` once, not once per call —
+        each ``setup()`` opens its own connection, so the unsynchronised
+        version turned the first fan-out into a cold-connect stampede.
+        """
         if self._ready:
             return
         if self._backend is None:
             raise NotConfiguredError("尚未呼叫 configure()。")
-        dense_dim = self._dense.dimension if self._dense else None
-        sparse_dim = self._sparse.dimension if self._sparse else None
-        logger.debug("vector_store_setup", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
-        await self._backend.setup(dense_dim, sparse_dim)
-        self._ready = True
-        logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
+        async with self._ready_lock:
+            if self._ready:
+                return
+            dense_dim = self._dense.dimension if self._dense else None
+            sparse_dim = self._sparse.dimension if self._sparse else None
+            logger.debug("vector_store_setup", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
+            await self._backend.setup(dense_dim, sparse_dim)
+            self._ready = True
+            logger.info("vector_store_ready", extra={"dense_dim": dense_dim, "sparse_dim": sparse_dim})
+
+    async def prewarm(self, connections: int | None = None) -> None:
+        """Run first-use setup and pre-open a batch of DB connections now,
+        instead of on the first (usually concurrent) ``ingest()`` calls.
+
+        Call once, after ``configure()``, from a host that fans out many
+        concurrent ``ingest()`` calls: it collapses the initial ``setup()`` +
+        cold-connect burst — whose per-connection DNS lookups otherwise
+        stampede asyncio's default executor and time out — into one
+        sequential warm-up. No-op-safe if the backend exposes no ``prewarm``.
+        """
+        await self._ensure_ready()
+        backend_prewarm = getattr(self._backend, "prewarm", None)
+        if backend_prewarm is not None:
+            await backend_prewarm(connections)
 
     async def _embed_in_batches_dense(self, chunks: list[str]) -> list[list[float]]:
         assert self._dense_coordinator is not None

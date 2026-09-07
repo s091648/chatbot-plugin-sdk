@@ -84,12 +84,48 @@ class SyncPgBackend:
             f"postgresql+psycopg2://{config.user}:{config.password}"
             f"@{config.host}:{config.port}/{config.dbname}"
         )
-        self._engine = create_engine(url, pool_size=5, max_overflow=10, future=True)
+        self._engine = create_engine(
+            url,
+            pool_size=config.pool_size,
+            max_overflow=config.max_overflow,
+            pool_timeout=config.pool_timeout,
+            pool_recycle=config.pool_recycle,
+            pool_pre_ping=config.pool_pre_ping,
+            connect_args={"connect_timeout": int(config.connect_timeout)},
+            future=True,
+        )
         self._Session = sessionmaker(self._engine)
         self.schema = config.schema
         self.articles_table = config.articles_table
         self.chunks_table = config.chunks_table
+        self._pool_size = config.pool_size
         self._sparse_dim: int | None = None
+
+    # ── Pool pre-warm ──────────────────────────────────────────────────────
+
+    async def prewarm(self, connections: int | None = None) -> None:
+        """Open ``connections`` real connections (default: ``pool_size``) up
+        front and return them to the pool, so the first burst of concurrent
+        callers reuses warm connections instead of each opening a cold one.
+        Runs in the event loop's executor (like every other method here).
+        Best-effort; safe to call more than once."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._prewarm_sync, connections)
+
+    def _prewarm_sync(self, connections: int | None) -> None:
+        n = self._pool_size if connections is None else connections
+        held = []
+        try:
+            for _ in range(max(0, n)):
+                try:
+                    conn = self._engine.connect()
+                except Exception:
+                    break
+                held.append(conn)
+                conn.execute(text("SELECT 1"))
+        finally:
+            for conn in held:
+                conn.close()
 
     # ── Async wrappers (schedule sync work onto the event loop's thread pool) ──
 
