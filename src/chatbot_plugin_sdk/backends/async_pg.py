@@ -56,14 +56,52 @@ class AsyncPgBackend:
             f"postgresql+asyncpg://{config.user}:{config.password}"
             f"@{config.host}:{config.port}/{config.dbname}"
         )
-        self._engine = create_async_engine(url, pool_size=5, max_overflow=10, future=True)
+        self._engine = create_async_engine(
+            url,
+            pool_size=config.pool_size,
+            max_overflow=config.max_overflow,
+            pool_timeout=config.pool_timeout,
+            pool_recycle=config.pool_recycle,
+            pool_pre_ping=config.pool_pre_ping,
+            connect_args={"timeout": config.connect_timeout},
+            future=True,
+        )
         self._session_factory = async_sessionmaker(
             self._engine, class_=AsyncSession, expire_on_commit=False
         )
         self.schema = config.schema
         self.articles_table = config.articles_table
         self.chunks_table = config.chunks_table
+        self._pool_size = config.pool_size
         self._sparse_dim: int | None = None
+
+    # ── Pool pre-warm ──────────────────────────────────────────────────────
+
+    async def prewarm(self, connections: int | None = None) -> None:
+        """Open ``connections`` real connections (default: ``pool_size``) up
+        front, sequentially, and hand them straight back to the pool.
+
+        The first burst of concurrent ``upsert()`` / ``search_*()`` callers
+        then checks out warm connections instead of each racing a brand-new
+        connect — whose DNS lookup runs on asyncio's small default
+        ``ThreadPoolExecutor`` and, under a stampede, queues past
+        ``connect_timeout`` and fails. Best-effort: a connection that can't be
+        opened is skipped, so a transient blip during warm-up doesn't abort
+        the caller. Safe to call more than once.
+        """
+        n = self._pool_size if connections is None else connections
+        held = []
+        try:
+            for _ in range(max(0, n)):
+                try:
+                    conn = await self._engine.connect()
+                except Exception:
+                    break
+                held.append(conn)
+                await conn.execute(text("SELECT 1"))
+        finally:
+            for conn in held:
+                await conn.close()
 
     # ── Setup / validation ─────────────────────────────────────────────────
 
