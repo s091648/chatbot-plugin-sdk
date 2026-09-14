@@ -9,18 +9,26 @@ sends its own embed_batch_size-sized batches straight at the provider — every
 concurrent caller's batches compete for the same per-minute budget with no
 coordination between them. See scrape-analyzer's specs/024-async-pipeline-refactor
 research.md item 11 for the production trace that motivated this.
+
+Provider-agnostic: works with either a DenseEmbeddingProvider or a
+SparseEmbeddingProvider — the coordinator only ever calls `.embed(texts)` and
+forwards whatever it returns, never inspecting the vector shape itself, so
+IngestProcessor runs one coordinator instance per embedding kind (dense and
+sparse each get their own queue + worker + rate-limit headroom awareness,
+whichever concrete provider is plugged into either).
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Callable, List, Optional, TYPE_CHECKING
+from typing import Callable, List, Optional, TYPE_CHECKING, Union
 
 from chatbot_plugin_sdk.exceptions import EmbeddingError
 from chatbot_plugin_sdk.rate_limit import RpdExhausted, estimate_tokens
 
 if TYPE_CHECKING:
-    from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider
+    from chatbot_plugin_sdk.protocols import DenseEmbeddingProvider, SparseEmbeddingProvider
+    EmbeddingProvider = Union[DenseEmbeddingProvider, SparseEmbeddingProvider]
 
 
 @dataclass
@@ -43,24 +51,25 @@ class EmbeddingBatchCoordinator:
     between concurrent callers by construction, rather than merely reducing
     their frequency.
 
-    Batch formation is rate-limit-aware when ``dense`` exposes a ``rate_limit``
-    attribute whose value has a ``headroom()`` method (``SlidingWindowStrategy``
-    does; see its docstring) — the worker stops growing a batch as soon as the
-    next item would exceed the *currently available* RPM/TPM window, instead
-    of always growing to ``embed_batch_size`` and letting the provider's
-    ``acquire()`` block on the whole thing. This matters specifically for TPM:
-    without it, a batch sized purely by item count can sit right at the edge
-    of (or past) the real per-minute token budget on every single call —
-    small, unavoidable error in the token estimate (``estimate_tokens()`` is a
-    4-chars-≈-1-token approximation, not a real tokenizer) then reliably tips
-    real upstream usage over Google's actual quota even though the local
-    estimate looked fine, producing recurring 429s despite locally-configured
-    RPM/TPM matching the real quota. Right-sizing against live headroom
-    shrinks the blast radius of that estimation error instead of eliminating
-    it — ``acquire()`` remains the authoritative, blocking gate either way.
-    When ``dense`` has no ``rate_limit`` (or that limiter has no
-    ``headroom()``), batch formation falls back to the original count-only
-    behavior.
+    Batch formation is rate-limit-aware when the wrapped provider exposes a
+    ``rate_limit`` attribute whose value has a ``headroom()`` method
+    (``SlidingWindowStrategy`` does; see its docstring) — the worker stops
+    growing a batch as soon as the next item would exceed the *currently
+    available* RPM/TPM window, instead of always growing to
+    ``embed_batch_size`` and letting the provider's ``acquire()`` block on the
+    whole thing. This matters specifically for TPM: without it, a batch sized
+    purely by item count can sit right at the edge of (or past) the real
+    per-minute token budget on every single call — small, unavoidable error in
+    the token estimate (``estimate_tokens()`` is a 4-chars-≈-1-token
+    approximation, not a real tokenizer) then reliably tips real upstream
+    usage over the provider's actual quota even though the local estimate
+    looked fine, producing recurring 429s despite locally-configured RPM/TPM
+    matching the real quota. Right-sizing against live headroom shrinks the
+    blast radius of that estimation error instead of eliminating it —
+    ``acquire()`` remains the authoritative, blocking gate either way. When
+    the provider has no ``rate_limit`` (or that limiter has no
+    ``headroom()``) — e.g. a local/self-hosted model with no external quota —
+    batch formation falls back to the original count-only behavior.
 
     **Daily-quota (RPD) circuit breaker.** When a provider call raises
     :exc:`~chatbot_plugin_sdk.rate_limit.RpdExhausted` — the *daily* request
@@ -85,21 +94,25 @@ class EmbeddingBatchCoordinator:
     lazily on first use — never at ``__init__`` time, so it binds to
     whichever event loop is actually running when work is first submitted.
 
-    Usage::
+    Usage — one instance per embedding kind, each with its own queue/worker/
+    rate-limit headroom (IngestProcessor keeps a separate dense and sparse
+    coordinator for exactly this reason)::
 
-        coordinator = EmbeddingBatchCoordinator(dense=my_provider, embed_batch_size=16)
-        vectors = await coordinator.embed_many(["chunk 1", "chunk 2"])
+        dense_coordinator = EmbeddingBatchCoordinator(provider=my_dense_provider, embed_batch_size=16)
+        sparse_coordinator = EmbeddingBatchCoordinator(provider=my_sparse_provider, embed_batch_size=16)
+        dense_vectors = await dense_coordinator.embed_many(["chunk 1", "chunk 2"])
         ...
-        await coordinator.aclose()
+        await dense_coordinator.aclose()
+        await sparse_coordinator.aclose()
     """
 
     def __init__(
         self,
-        dense: "DenseEmbeddingProvider",
+        provider: "EmbeddingProvider",
         embed_batch_size: int = 16,
         queue_factory: Optional[QueueFactory] = None,
     ) -> None:
-        self._dense = dense
+        self._provider = provider
         self._embed_batch_size = embed_batch_size
         self._queue_factory: QueueFactory = queue_factory or (lambda: asyncio.Queue())
         self._queue: "asyncio.Queue[EmbedWorkItem] | None" = None
@@ -142,13 +155,14 @@ class EmbeddingBatchCoordinator:
         return list(await asyncio.gather(*(item.future for item in items)))
 
     def _headroom_fn(self):
-        """Return the dense provider's rate limiter's headroom() bound method,
-        or None if unavailable — either the provider exposes no rate_limit at
-        all (e.g. FastEmbedDenseProvider, a local model with no upstream
-        quota), or its rate_limit has no headroom() method (a custom
-        RateLimitStrategy implementation that predates this). None means
-        "fall back to count-only batching", not "unlimited"."""
-        rate_limit = getattr(self._dense, "rate_limit", None)
+        """Return the wrapped provider's rate limiter's headroom() bound
+        method, or None if unavailable — either the provider exposes no
+        rate_limit at all (e.g. FastEmbedDenseProvider/FastEmbedSparseProvider,
+        local models with no upstream quota), or its rate_limit has no
+        headroom() method (a custom RateLimitStrategy implementation that
+        predates this). None means "fall back to count-only batching", not
+        "unlimited"."""
+        rate_limit = getattr(self._provider, "rate_limit", None)
         if rate_limit is None:
             return None
         return getattr(rate_limit, "headroom", None)
@@ -230,7 +244,7 @@ class EmbeddingBatchCoordinator:
                 current_batch = batch  # tracked so a cancellation mid-embed() can still resolve it
                 texts = [b.text for b in batch]
                 try:
-                    vectors = await self._dense.embed(texts)
+                    vectors = await self._provider.embed(texts)
                     if len(vectors) != len(batch):
                         raise EmbeddingError(
                             f"Embedding provider returned {len(vectors)} vectors "

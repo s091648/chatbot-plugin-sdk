@@ -65,7 +65,7 @@ class TestSingleCaller:
     @pytest.mark.asyncio
     async def test_returns_vectors_in_order(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         vectors = await coordinator.embed_many(["a", "b", "c"])
         assert vectors == [[0.1, 0.2, 0.3]] * 3
         await coordinator.aclose()
@@ -73,7 +73,7 @@ class TestSingleCaller:
     @pytest.mark.asyncio
     async def test_empty_input_returns_empty_without_starting_worker(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         assert await coordinator.embed_many([]) == []
         assert dense.calls == []
         assert coordinator._worker_task is None
@@ -81,7 +81,7 @@ class TestSingleCaller:
     @pytest.mark.asyncio
     async def test_one_call_over_batch_size_splits_into_multiple_provider_calls(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=2)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=2)
         vectors = await coordinator.embed_many(["a", "b", "c", "d", "e"])
         assert len(vectors) == 5
         assert len(dense.calls) >= 3  # 5 items, batch_size=2 -> at least ceil(5/2)=3 calls
@@ -95,7 +95,7 @@ class TestConcurrentCallers:
     @pytest.mark.asyncio
     async def test_two_concurrent_calls_share_one_worker_and_may_batch_together(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
 
         results = await asyncio.gather(
             coordinator.embed_many(["a", "b"]),
@@ -113,7 +113,7 @@ class TestConcurrentCallers:
     @pytest.mark.asyncio
     async def test_only_one_worker_task_regardless_of_caller_count(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await asyncio.gather(*(coordinator.embed_many([f"chunk-{i}"]) for i in range(10)))
         assert coordinator._worker_task is not None
         await coordinator.aclose()
@@ -128,7 +128,7 @@ class TestBatchFailure:
             raise RuntimeError("provider exploded")
 
         dense = _dense(embed_side_effect=_boom)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RuntimeError, match="provider exploded"):
             await coordinator.embed_many(["a", "b"])
         await coordinator.aclose()
@@ -143,7 +143,7 @@ class TestBatchFailure:
             return [[0.1, 0.2, 0.3]]  # always 1 vector, regardless of batch size
 
         dense = _dense(embed_side_effect=_short_response)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(EmbeddingError, match="3 texts"):
             await asyncio.wait_for(coordinator.embed_many(["a", "b", "c"]), timeout=5)
         await coordinator.aclose()
@@ -159,7 +159,7 @@ class TestBatchFailure:
             return [[0.1, 0.2, 0.3] for _ in texts]
 
         dense = _dense(embed_side_effect=_fail_once)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RuntimeError):
             await coordinator.embed_many(["a"])
         vectors = await coordinator.embed_many(["b"])
@@ -182,7 +182,7 @@ class TestRateLimitCircuitBreaker:
             raise RpdExhausted("Daily request cap of 1000 reached.")
 
         dense = _dense(embed_side_effect=_rpd_spent)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=1)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=1)
 
         results = await asyncio.gather(
             *(coordinator.embed_many([f"chunk-{i}"]) for i in range(20)),
@@ -201,7 +201,7 @@ class TestRateLimitCircuitBreaker:
             raise RpdExhausted("Daily request cap reached.")
 
         dense = _dense(embed_side_effect=_rpd_spent)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RpdExhausted):
             await coordinator.embed_many(["a"])
         calls_after_first = len(dense.calls)
@@ -222,7 +222,7 @@ class TestRateLimitCircuitBreaker:
             return [[0.1, 0.2, 0.3] for _ in texts]
 
         dense = _dense(embed_side_effect=_rpd_then_ok)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RpdExhausted):
             await coordinator.embed_many(["a"])
 
@@ -246,7 +246,7 @@ class TestRateLimitCircuitBreaker:
             return [[0.1, 0.2, 0.3] for _ in texts]
 
         dense = _dense(embed_side_effect=_rpm_once_then_ok)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RpmExhausted):
             await coordinator.embed_many(["a"])
         assert coordinator._fatal_exc is None  # not latched
@@ -265,7 +265,7 @@ class TestRateLimitCircuitBreaker:
             raise RateLimitExhausted("429, dimension unknown")
 
         dense = _dense(embed_side_effect=_unknown_dimension)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         with pytest.raises(RateLimitExhausted):
             await coordinator.embed_many(["a"])
         assert coordinator._fatal_exc is None
@@ -285,7 +285,7 @@ class TestQueueFactory:
             return q
 
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16, queue_factory=factory)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16, queue_factory=factory)
         await coordinator.embed_many(["a"])
         assert len(created) == 1
         assert coordinator._queue is created[0]
@@ -294,7 +294,7 @@ class TestQueueFactory:
     @pytest.mark.asyncio
     async def test_default_factory_produces_plain_asyncio_queue(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.embed_many(["a"])
         assert type(coordinator._queue) is asyncio.Queue
         await coordinator.aclose()
@@ -302,7 +302,7 @@ class TestQueueFactory:
     @pytest.mark.asyncio
     async def test_queue_not_built_until_first_use(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         assert coordinator._queue is None
         await coordinator.embed_many(["a"])
         assert coordinator._queue is not None
@@ -315,13 +315,13 @@ class TestGetSetQueue:
     @pytest.mark.asyncio
     async def test_get_queue_returns_none_before_first_use(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         assert coordinator.get_queue() is None
 
     @pytest.mark.asyncio
     async def test_get_queue_returns_current_queue_after_first_use(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.embed_many(["a"])
         assert coordinator.get_queue() is coordinator._queue
         assert isinstance(coordinator.get_queue(), asyncio.Queue)
@@ -330,7 +330,7 @@ class TestGetSetQueue:
     @pytest.mark.asyncio
     async def test_set_queue_before_any_use_just_swaps_it(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         custom_queue = asyncio.Queue()
         await coordinator.set_queue(custom_queue)
         assert coordinator.get_queue() is custom_queue
@@ -358,7 +358,7 @@ class TestGetSetQueue:
             return [[0.1, 0.2, 0.3] for _ in texts]
 
         dense = _dense(embed_side_effect=_blocking_first_call)
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=1)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=1)
 
         first = asyncio.ensure_future(coordinator.embed_many(["a"]))
         await claimed_a.wait()  # worker has popped "a" off the queue and is now blocked inside embed()
@@ -380,7 +380,7 @@ class TestGetSetQueue:
     @pytest.mark.asyncio
     async def test_set_queue_restarts_worker_so_new_submissions_still_work(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.embed_many(["a"])  # starts the worker
 
         new_queue = asyncio.Queue()
@@ -397,13 +397,13 @@ class TestAclose:
     @pytest.mark.asyncio
     async def test_aclose_before_any_use_is_a_noop(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.aclose()  # must not raise
 
     @pytest.mark.asyncio
     async def test_aclose_cancels_worker_task(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.embed_many(["a"])
         worker = coordinator._worker_task
         await coordinator.aclose()
@@ -412,7 +412,7 @@ class TestAclose:
     @pytest.mark.asyncio
     async def test_aclose_is_idempotent(self):
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         await coordinator.embed_many(["a"])
         await coordinator.aclose()
         await coordinator.aclose()  # must not raise
@@ -425,7 +425,7 @@ class TestHeadroomAwareBatching:
     async def test_batch_shrinks_to_available_rpm_headroom(self):
         # rpm headroom = 2 request units; every 1-char text costs 1 unit.
         dense = _dense_with_rate_limit([(2, 100)])
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         vectors = await coordinator.embed_many(["a", "b", "c", "d", "e"])
         assert len(vectors) == 5
         # 5 items split 2/2/1 instead of one embed_batch_size=16 call — FIFO
@@ -439,7 +439,7 @@ class TestHeadroomAwareBatching:
         # every 4-char text to 1 — an unequal-weight case count-only batching
         # can't express.
         dense = _dense_with_rate_limit([(100, 3)])
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         vectors = await coordinator.embed_many(["aaaa", "bbbb", "cccccccc", "dddd"])
         assert len(vectors) == 4
         assert dense.calls == [["aaaa", "bbbb"], ["cccccccc", "dddd"]]
@@ -451,7 +451,7 @@ class TestHeadroomAwareBatching:
         even when headroom() reports nothing available. acquire() (not this
         pre-check) remains the actual blocking gate for that case."""
         dense = _dense_with_rate_limit([(0, 0)])
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         vectors = await coordinator.embed_many(["a"])
         assert vectors == [[0.1, 0.2, 0.3]]
         assert dense.calls == [["a"]]
@@ -460,7 +460,7 @@ class TestHeadroomAwareBatching:
     @pytest.mark.asyncio
     async def test_unlimited_headroom_behaves_like_count_only_batching(self):
         dense = _dense_with_rate_limit([(float("inf"), float("inf"))])
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=16)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=16)
         vectors = await coordinator.embed_many(["a", "b", "c"])
         assert len(vectors) == 3
         assert dense.calls == [["a", "b", "c"]]
@@ -472,7 +472,7 @@ class TestHeadroomAwareBatching:
         FastEmbedDenseProvider with no upstream quota — must behave exactly
         as before this change."""
         dense = _dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=2)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=2)
         vectors = await coordinator.embed_many(["a", "b", "c"])
         assert len(vectors) == 3
         assert dense.calls == [["a", "b"], ["c"]]
@@ -499,7 +499,7 @@ class TestHeadroomAwareBatching:
                 return [[0.1, 0.2, 0.3] for _ in texts]
 
         dense = _Dense()
-        coordinator = EmbeddingBatchCoordinator(dense=dense, embed_batch_size=2)
+        coordinator = EmbeddingBatchCoordinator(provider=dense, embed_batch_size=2)
         vectors = await coordinator.embed_many(["a", "b", "c"])
         assert len(vectors) == 3
         assert dense.calls == [["a", "b"], ["c"]]

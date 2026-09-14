@@ -60,6 +60,7 @@ class IngestProcessor:
         self._chunk_size: int = DEFAULT_CHUNK_SIZE
         self._chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
         self._dense_coordinator: EmbeddingBatchCoordinator | None = None
+        self._sparse_coordinator: EmbeddingBatchCoordinator | None = None
 
     def configure(
         self,
@@ -68,6 +69,7 @@ class IngestProcessor:
         sparse: SparseEmbeddingProvider | None = None,
         embed_batch_size: int = 16,
         embed_queue_factory: QueueFactory | None = None,
+        sparse_embed_queue_factory: QueueFactory | None = None,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     ) -> None:
@@ -83,6 +85,9 @@ class IngestProcessor:
                               ``asyncio.Queue`` subclass (priority ordering,
                               instrumentation, etc.) here. Defaults to a plain
                               ``asyncio.Queue()``. Ignored when ``dense`` is None.
+            sparse_embed_queue_factory: Same seam as ``embed_queue_factory``,
+                              for the sparse-embedding coordinator's own,
+                              independent queue. Ignored when ``sparse`` is None.
             chunk_size: Maximum characters per chunk. Default: 500.
             chunk_overlap: Overlap characters between consecutive chunks. Default: 50.
         """
@@ -97,11 +102,23 @@ class IngestProcessor:
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
         self._ready = False
+        # Dense and sparse each get their own coordinator — independent queue,
+        # independent worker task, independent rate-limit headroom awareness —
+        # so ingest() can run both concurrently (see ingest() below) without
+        # one embedding kind's batching decisions interfering with the
+        # other's, even though both may be draining chunks from the same
+        # article at the same time.
         self._dense_coordinator = (
             EmbeddingBatchCoordinator(
-                dense=dense, embed_batch_size=embed_batch_size, queue_factory=embed_queue_factory,
+                provider=dense, embed_batch_size=embed_batch_size, queue_factory=embed_queue_factory,
             )
             if dense is not None else None
+        )
+        self._sparse_coordinator = (
+            EmbeddingBatchCoordinator(
+                provider=sparse, embed_batch_size=embed_batch_size, queue_factory=sparse_embed_queue_factory,
+            )
+            if sparse is not None else None
         )
 
     async def _ensure_ready(self) -> None:
@@ -145,13 +162,39 @@ class IngestProcessor:
         assert self._dense_coordinator is not None
         return await self._dense_coordinator.embed_many(chunks)
 
+    async def _maybe_embed_dense(self, chunks: list[str]) -> list[list[float]] | None:
+        """None (a no-op) when dense isn't configured; otherwise embeds and
+        validates the result — split out from ingest() so it can be run
+        concurrently with _maybe_embed_sparse via asyncio.gather()."""
+        if self._dense is None:
+            return None
+        vectors = await self._embed_in_batches_dense(chunks)
+        if len(vectors) != len(chunks):
+            raise DatabaseError(
+                f"Dense embedding returned {len(vectors)} vectors but {len(chunks)} chunks expected."
+            )
+        return vectors
+
+    async def _maybe_embed_sparse(self, chunks: list[str]) -> list[dict[str, float]] | None:
+        """Sparse counterpart of _maybe_embed_dense — see its docstring."""
+        if self._sparse is None:
+            return None
+        vectors = await self._embed_in_batches_sparse(chunks)
+        if len(vectors) != len(chunks):
+            raise DatabaseError(
+                f"Sparse embedding returned {len(vectors)} vectors but {len(chunks)} chunks expected."
+            )
+        return vectors
+
     async def aclose(self) -> None:
-        """Release background resources — cancels the dense-embedding
-        coordinator's worker task, if one was ever started. Idempotent; safe
-        to call even if ``configure()`` was never called or ``dense`` isn't
-        configured."""
+        """Release background resources — cancels the dense- and sparse-
+        embedding coordinators' worker tasks, for whichever were ever
+        started. Idempotent; safe to call even if ``configure()`` was never
+        called or neither ``dense`` nor ``sparse`` is configured."""
         if self._dense_coordinator is not None:
             await self._dense_coordinator.aclose()
+        if self._sparse_coordinator is not None:
+            await self._sparse_coordinator.aclose()
 
     def get_embed_queue(self) -> "asyncio.Queue[EmbedWorkItem] | None":
         """Return the dense-embedding coordinator's current queue, or None if
@@ -172,12 +215,26 @@ class IngestProcessor:
             raise NotConfiguredError("Dense embedding isn't configured — nothing to set a queue on.")
         await self._dense_coordinator.set_queue(queue)
 
+    def get_embed_sparse_queue(self) -> "asyncio.Queue[EmbedWorkItem] | None":
+        """Sparse-embedding counterpart of get_embed_queue() — returns the
+        sparse coordinator's own, independent queue, or None if sparse
+        embedding isn't configured or no work has been submitted yet."""
+        if self._sparse_coordinator is None:
+            return None
+        return self._sparse_coordinator.get_queue()
+
+    async def set_embed_sparse_queue(self, queue: "asyncio.Queue[EmbedWorkItem]") -> None:
+        """Sparse-embedding counterpart of set_embed_queue() — see
+        EmbeddingBatchCoordinator.set_queue() for the safe-swap semantics.
+
+        Raises NotConfiguredError if sparse embedding isn't configured."""
+        if self._sparse_coordinator is None:
+            raise NotConfiguredError("Sparse embedding isn't configured — nothing to set a queue on.")
+        await self._sparse_coordinator.set_queue(queue)
+
     async def _embed_in_batches_sparse(self, chunks: list[str]) -> list[dict[str, float]]:
-        results: list[dict[str, float]] = []
-        for i in range(0, len(chunks), self._embed_batch_size):
-            batch = chunks[i : i + self._embed_batch_size]
-            results.extend(await self._sparse.embed(batch))  # type: ignore[union-attr]
-        return results
+        assert self._sparse_coordinator is not None
+        return await self._sparse_coordinator.embed_many(chunks)
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -222,24 +279,20 @@ class IngestProcessor:
         if not chunks:
             raise DatabaseError("No chunks produced — input text may be too short.")
 
-        dense_vectors: list[list[float]] | None = None
-        sparse_vectors: list[dict[str, float]] | None = None
-
-        if self._dense is not None:
-            dense_vectors = await self._embed_in_batches_dense(chunks)
-            if len(dense_vectors) != len(chunks):
-                raise DatabaseError(
-                    f"Dense embedding returned {len(dense_vectors)} vectors "
-                    f"but {len(chunks)} chunks expected."
-                )
-
-        if self._sparse is not None:
-            sparse_vectors = await self._embed_in_batches_sparse(chunks)
-            if len(sparse_vectors) != len(chunks):
-                raise DatabaseError(
-                    f"Sparse embedding returned {len(sparse_vectors)} vectors "
-                    f"but {len(chunks)} chunks expected."
-                )
+        # Dense and sparse embed the same chunks independently — neither needs
+        # the other's result — so run them concurrently via separate
+        # coordinators (see configure()) instead of sequentially. If either
+        # fails, cancel the other rather than leaving it to keep enqueuing/
+        # running in the background after this ingest() call has already
+        # raised for this article.
+        dense_task = asyncio.ensure_future(self._maybe_embed_dense(chunks))
+        sparse_task = asyncio.ensure_future(self._maybe_embed_sparse(chunks))
+        try:
+            dense_vectors, sparse_vectors = await asyncio.gather(dense_task, sparse_task)
+        except BaseException:
+            dense_task.cancel()
+            sparse_task.cancel()
+            raise
 
         logger.debug(
             "ingest_upserting",
