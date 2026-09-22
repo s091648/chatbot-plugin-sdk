@@ -32,6 +32,12 @@ _MAX_RETRYABLE_DELAY_SECS = 300.0
 # typically clears within seconds, not hours.
 _DEFAULT_QUOTA_BACKOFF_SECS = 15.0
 
+# Backoff between retries of a transient 503 ("The model is overloaded,
+# please try again later") / 502 — not a quota condition (no RPD/RPM/TPM
+# dimension applies), just Google-side capacity that usually clears within
+# seconds, so a short fixed wait is enough.
+_OVERLOAD_BACKOFF_SECS = 5.0
+
 
 def _parse_retry_delay(exc: Exception) -> float | None:
     """Extract the Google-suggested retry delay (seconds) from a 429 error.
@@ -55,7 +61,38 @@ def _parse_retry_delay(exc: Exception) -> float | None:
 
 
 def _is_quota_error(exc: Exception) -> bool:
-    return "429" in str(exc) or getattr(exc, "status_code", None) == 429
+    """True for a 429.
+
+    Prefers the structured ``.code`` attribute that
+    ``google.genai.errors.APIError`` actually sets before falling back to a
+    substring scan for exceptions that aren't a genai ``APIError`` at all.
+    Previously checked ``.status_code`` instead of ``.code`` — no
+    google-genai exception has ever exposed that name, so that check was
+    dead code, silently masked because the substring check below usually
+    also matched.
+    """
+    if getattr(exc, "code", None) == 429:
+        return True
+    return "429" in str(exc)
+
+
+def _is_overloaded_error(exc: Exception) -> bool:
+    """True for Gemini's transient 503 ("The model is overloaded, please try
+    again later") or a 502 — neither carries a 429 status, so
+    :func:`_is_quota_error` never matches them. Before this, such errors fell
+    straight through ``GeminiDenseProvider.embed()``'s quota-handling branch
+    into a hard, immediate ``EmbeddingError`` with no retry at all — in
+    production this looked exactly like "rate limiting stopped working",
+    when the real cause was that the error never reached the rate-limit
+    machinery in the first place. These aren't a quota condition (no
+    RPD/RPM/TPM dimension applies), just transient capacity errors on
+    Google's side that usually clear within seconds — handled as a plain
+    retry-with-backoff, independent of the 429 quota path below.
+    """
+    if getattr(exc, "code", None) in (502, 503):
+        return True
+    msg = str(exc)
+    return "503" in msg or "502" in msg or "UNAVAILABLE" in msg
 
 
 def _is_daily_quota_error(exc: Exception) -> bool:
@@ -87,26 +124,94 @@ def _is_token_quota_error(exc: Exception) -> bool:
     return "token" in msg.lower()
 
 
-def _quota_dimension(exc: Exception) -> str:
-    """Names which Google quota dimension a 429 violated, for logging.
+def _is_request_quota_error(exc: Exception) -> bool:
+    """True when the 429 is a per-minute REQUEST-COUNT quota (RPM), not RPD or TPM.
+
+    Positive counterpart to :func:`_is_token_quota_error` — request-count
+    quotas' ``quotaId`` contains ``Requests`` (e.g.
+    ``GenerateRequestsPerMinutePerProjectPerModel-FreeTier``), the substring
+    :func:`_quota_dimension`'s docstring already documented this module as
+    relying on, but which (before this) was never actually checked for —
+    "not daily, not token" was silently treated as "must be rpm" instead.
+    Checked after :func:`_is_daily_quota_error` so a daily request cap
+    (which also contains ``Requests``) stays classified as RPD, not RPM.
+    """
+    msg = str(exc)
+    if "RESOURCE_EXHAUSTED" not in msg or "PerDay" in msg:
+        return False
+    return "request" in msg.lower()
+
+
+def _dimension_from_local_headroom(rate_limit: "RateLimitStrategy | None") -> str:
+    """Disambiguates RPM vs TPM for a 429 whose body carries no classifiable
+    ``QuotaFailure`` detail at all — confirmed in production (scrape-analyzer,
+    2026-09-22 RAG ingest incident): some accounts/tiers' 429 responses
+    include only a generic ``google.rpc.Help`` link, no ``violations[].quotaId``
+    whatsoever, so none of :func:`_is_daily_quota_error`/
+    :func:`_is_token_quota_error`/:func:`_is_request_quota_error` can match.
+    Blindly assuming "rpm" in that case (the historical behavior) was itself
+    the bug: it let a real, repeated TPM exhaustion keep retrying the same
+    full-size batch under ``split_batch_on_tpm`` instead of ever shrinking it,
+    because ``dimension`` was never "tpm" for that account's error shape.
+
+    Falls back to the provider's own local ``SlidingWindowStrategy.headroom()``
+    instead: a limiter configured to mirror the real account quota (the
+    intended way to use this SDK — see ``build_dense_provider``'s ``rpm``/
+    ``tpm`` args) already knows, independent of what Google's response body
+    does or doesn't disclose, which dimension it's currently closer to
+    exhausting. Reports whichever of RPM/TPM has proportionally less headroom
+    left *locally* — not a guess, but the same live accounting
+    :class:`~chatbot_plugin_sdk.batching.EmbeddingBatchCoordinator` already
+    trusts to size batches before dispatching them.
+
+    Still falls back to the historical ``"rpm"`` default when no ``rate_limit``
+    was given, it exposes no ``headroom()`` (a custom ``RateLimitStrategy``
+    predating it), or ``headroom()`` itself raises — no local signal available
+    is not a reason to guess differently than before.
+    """
+    headroom_fn = getattr(rate_limit, "headroom", None) if rate_limit is not None else None
+    if headroom_fn is None:
+        return "rpm"
+    try:
+        remaining_units, remaining_tokens = headroom_fn()
+    except Exception:
+        return "rpm"
+    rpm_cap = getattr(rate_limit, "rpm", 0) or 0
+    tpm_cap = getattr(rate_limit, "tpm", 0) or 0
+    rpm_frac = (remaining_units / rpm_cap) if rpm_cap > 0 else 1.0
+    tpm_frac = (remaining_tokens / tpm_cap) if tpm_cap > 0 else 1.0
+    return "tpm" if tpm_frac < rpm_frac else "rpm"
+
+
+def _quota_dimension(exc: Exception, rate_limit: "RateLimitStrategy | None" = None) -> str:
+    """Names which Google quota dimension a 429 violated, for logging *and*
+    (as of this fix) for gating ``split_batch_on_tpm`` — see ``GeminiDenseProvider.embed()``.
 
     Built on the same ``QuotaFailure.violations[].quotaId`` substring checks
-    as :func:`_is_daily_quota_error`/:func:`_is_token_quota_error` (kept as
-    separate booleans there since each gates different retry behavior) —
-    this just labels the result so log lines can show *which* of RPD/TPM/RPM
-    was hit instead of only whether a retry delay was parseable. Returns
-    ``"unknown"`` for a 429 whose error body doesn't carry a recognizable
-    quotaId (e.g. Google changes the format, or a non-``RESOURCE_EXHAUSTED``
-    429 reaches here via the plain ``"429"`` substring check in
-    :func:`_is_quota_error`).
+    as :func:`_is_daily_quota_error`/:func:`_is_token_quota_error`/
+    :func:`_is_request_quota_error` (kept as separate booleans there since
+    each gates different retry behavior) — this labels the result so log
+    lines and callers can see *which* of RPD/TPM/RPM was hit. When none of
+    the three match (Google's body carries no recognizable ``quotaId`` at
+    all, not merely an unrecognized one) falls back to
+    :func:`_dimension_from_local_headroom` rather than assuming "rpm"
+    outright. Returns ``"unknown"`` only when the 429 isn't even
+    ``RESOURCE_EXHAUSTED``-shaped (e.g. a non-quota 429 reaches here via the
+    plain ``"429"`` substring check in :func:`_is_quota_error`).
+
+    ``rate_limit``: the calling provider's own configured rate limiter
+    (``self._rate_limit``) — optional, purely to feed the headroom fallback;
+    omit it to get the pre-fix behavior for the unclassifiable case.
     """
     if _is_daily_quota_error(exc):
         return "rpd"
     if _is_token_quota_error(exc):
         return "tpm"
-    if "RESOURCE_EXHAUSTED" in str(exc):
+    if _is_request_quota_error(exc):
         return "rpm"
-    return "unknown"
+    if "RESOURCE_EXHAUSTED" not in str(exc):
+        return "unknown"
+    return _dimension_from_local_headroom(rate_limit)
 
 
 _DIMENSION_EXC: dict[str, type[RateLimitExhausted]] = {
@@ -145,12 +250,18 @@ class GeminiDenseProvider:
     time to flip back off. Re-checking once per process (this latch) and
     trusting the next process's first real call to re-probe Google avoids
     that problem entirely.
-    A per-minute TOKEN quota (TPM) violation, also detected from the
-    ``QuotaFailure`` detail, is retried the same way by default; passing
-    ``split_batch_on_tpm=True`` makes it instead wait out the suggested delay
-    *and* halve the batch before retrying each half — waiting alone doesn't
-    help when the batch itself is the problem, and halving alone doesn't help
-    if requests are still fired back-to-back, so the two are combined.
+    A per-minute TOKEN quota (TPM) violation is retried the same way by
+    default; passing ``split_batch_on_tpm=True`` makes it instead wait out
+    the suggested delay *and* halve the batch before retrying each half —
+    waiting alone doesn't help when the batch itself is the problem, and
+    halving alone doesn't help if requests are still fired back-to-back, so
+    the two are combined. TPM detection prefers the ``QuotaFailure`` detail
+    in Google's error body when present, but falls back to the provider's
+    own local rate-limiter headroom (:func:`_dimension_from_local_headroom`)
+    when that detail is absent entirely — some accounts/tiers' 429 responses
+    carry only a generic ``google.rpc.Help`` link, no structured quota
+    detail, which previously made every such 429 default to "rpm" and never
+    engage ``split_batch_on_tpm`` even when the real, repeated cause was TPM.
     A 429 confirmed as non-daily (RPM/TPM/unknown) but with no parseable
     ``retryDelay`` (Google's error body doesn't always include one — e.g. it
     may carry only a ``google.rpc.Help`` link) falls back to a fixed
@@ -164,9 +275,15 @@ class GeminiDenseProvider:
     ``TpmExhausted``, or the plain base class if the dimension couldn't be
     determined) rather than the raw ``google.genai`` exception, so every
     quota-exhaustion path is catchable by callers as one type — or as a
-    specific dimension, e.g. to circuit-break only on ``RpdExhausted``. Any
-    other failure (network error, malformed response, auth failure) is
-    raised as ``EmbeddingError``, never the raw SDK/HTTP exception.
+    specific dimension, e.g. to circuit-break only on ``RpdExhausted``. A
+    transient 503 ("model is overloaded") or 502 — never shaped as a 429, so
+    it wouldn't otherwise be recognized as retryable at all — is retried up
+    to ``max_retries`` with a fixed short backoff and, if still failing after
+    that, raised as ``EmbeddingError`` (not a ``RateLimitExhausted``
+    subclass: it isn't a quota condition, no RPD/RPM/TPM dimension applies).
+    Any other failure (network error, malformed response, auth failure) is
+    raised as ``EmbeddingError`` immediately, never the raw SDK/HTTP
+    exception.
 
     Args:
         api_key: Gemini API key.
@@ -292,6 +409,27 @@ class GeminiDenseProvider:
                         self._rate_limit.record_usage(actual_tokens)
                     return result
                 except Exception as exc:
+                    if _is_overloaded_error(exc):
+                        if attempt >= self._max_retries - 1:
+                            logger.error(
+                                "gemini_overloaded_max_retries_exceeded",
+                                extra={"attempts": self._max_retries, "model": self._model},
+                            )
+                            raise EmbeddingError(
+                                f"Gemini embedding request failed after "
+                                f"{self._max_retries} retries (model overloaded): {exc}"
+                            ) from exc
+                        logger.warning(
+                            "gemini_overloaded_retrying",
+                            extra={
+                                "attempt": attempt + 1,
+                                "max": self._max_retries,
+                                "delay": _OVERLOAD_BACKOFF_SECS,
+                            },
+                        )
+                        await asyncio.sleep(_OVERLOAD_BACKOFF_SECS)
+                        continue
+
                     if not _is_quota_error(exc):
                         raise EmbeddingError(
                             f"Gemini embedding request failed: {exc}"
@@ -308,12 +446,12 @@ class GeminiDenseProvider:
                         ) from exc
 
                     delay = _parse_retry_delay(exc)
-                    dimension = _quota_dimension(exc)
+                    dimension = _quota_dimension(exc, self._rate_limit)
 
                     if (
                         self._split_batch_on_tpm
                         and len(texts) > 1
-                        and _is_token_quota_error(exc)
+                        and dimension == "tpm"
                     ):
                         logger.warning(
                             "gemini_tpm_quota_split",
